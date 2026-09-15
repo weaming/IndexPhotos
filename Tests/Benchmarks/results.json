@@ -1,0 +1,49 @@
+{
+  "date": "2026-09-16",
+  "timezone": "Asia/Hong_Kong",
+  "host": {
+    "model": "Mac mini",
+    "arch": "arm64",
+    "macos": "26.4.1",
+    "xcode": "26.2"
+  },
+  "synthetic_benchmarks": {
+    "swift_build": "Debug",
+    "checkpoints": [
+      { "files": 1000, "before_seconds": 0.832240542, "after_seconds": 0.231481167 },
+      { "files": 3000, "before_seconds": 3.469238542, "after_seconds": 0.624966791 }
+    ],
+    "duplicate_heavy_index": {
+      "files": 6000,
+      "before_seconds": 1.263861875,
+      "after_seconds": 0.00685125
+    }
+  },
+  "external_drive": {
+    "swift_build": "Release (-O)",
+    "cache_condition": "OS file cache was not flushed; application caches were isolated and initially empty",
+    "full": {
+      "root": "/Volumes/ApplePhotos/苹果相册",
+      "status": "timeout",
+      "timeout_seconds": 30,
+      "committed_files_at_exit": 1014,
+      "processed_bytes_at_exit": 359829644,
+      "failed_files_at_exit": 0,
+      "result_index_completed": false
+    },
+    "reduced_scope": {
+      "root": "/Volumes/ApplePhotos/苹果相册/2021.11.22/日食精选",
+      "status": "completed",
+      "timeout_seconds": 30,
+      "files": 47,
+      "formats": { "jpg": 35, "heic": 12 },
+      "processed_bytes": 86260201,
+      "elapsed_seconds": 2.629601875,
+      "max_rss_bytes": 55476224,
+      "failed_files": 0,
+      "duplicate_groups": 0,
+      "similarity_candidates": 0
+    }
+  },
+  "verification": { "swift_tests_passed": 21, "rust_tests_passed": 4, "clippy": "passed with -D warnings" }
+}

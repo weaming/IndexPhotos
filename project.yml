@@ -1,0 +1,60 @@
+name: IndexPhotos
+
+options:
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+  developmentLanguage: zh-Hans
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    CODE_SIGN_IDENTITY: "-"
+
+targets:
+  IndexPhotos:
+    type: application
+    platform: macOS
+    sources:
+      - path: IndexPhotos
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.indexphotos.app
+        PRODUCT_NAME: IndexPhotos
+        INFOPLIST_KEY_CFBundleDisplayName: IndexPhotos
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.photography
+        GENERATE_INFOPLIST_FILE: YES
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: 0.1.0
+        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/rust-core/include/index_photos_rust.h"
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/rust-core/target/release"
+        OTHER_LDFLAGS:
+          - "-lsqlite3"
+          - "-lindex_photos_core"
+    preBuildScripts:
+      - name: Build Rust Core
+        script: |
+          cargo_path="$(command -v cargo || true)"
+          if [ -z "${cargo_path}" ] && [ -x "${HOME}/.cargo/bin/cargo" ]; then
+            cargo_path="${HOME}/.cargo/bin/cargo"
+          fi
+          if [ -z "${cargo_path}" ]; then
+            echo "error: 未找到 cargo，无法构建 rust-core"
+            exit 1
+          fi
+          MACOSX_DEPLOYMENT_TARGET="15.0" "${cargo_path}" build --manifest-path "${SRCROOT}/rust-core/Cargo.toml" --release
+        basedOnDependencyAnalysis: false
+    scheme:
+      testTargets:
+        - IndexPhotosTests
+
+  IndexPhotosTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/IndexPhotosTests
+    dependencies:
+      - target: IndexPhotos

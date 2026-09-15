@@ -1,0 +1,15 @@
+[package]
+name = "index_photos_core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+blake3 = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
