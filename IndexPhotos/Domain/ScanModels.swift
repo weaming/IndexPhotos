@@ -84,6 +84,19 @@ struct FastFeatureRecord: Codable, Sendable {
     let height: Int
 }
 
+struct EmbeddingInput: Sendable {
+    let assetID: String
+    let sourceFingerprint: String
+    let thumbnailRelativePath: String
+}
+
+struct IndexedEmbedding: Sendable {
+    let assetID: String
+    let sourceFingerprint: String
+    let contentHash: String?
+    let embedding: ImageEmbedding
+}
+
 struct ContentHashCandidate: Sendable {
     let assetID: String
     let path: String
@@ -123,6 +136,29 @@ struct SimilarityCandidateRecord: Sendable {
     let score: Double
     let evidenceJSON: String
     let algorithmVersion: String
+}
+
+enum ReviewDecision: String, Codable, Sendable {
+    case keep
+    case process
+    case ignore
+}
+
+struct SimilarityReviewItem: Identifiable, Equatable, Sendable {
+    let id: String
+    let assetAID: String
+    let assetAPath: String
+    let assetASourceFingerprint: String
+    let thumbnailARelativePath: String?
+    let assetBID: String
+    let assetBPath: String
+    let assetBSourceFingerprint: String
+    let thumbnailBRelativePath: String?
+    let relationKind: String
+    let score: Double
+    let evidenceJSON: String
+    let algorithmVersion: String
+    let decision: ReviewDecision?
 }
 
 struct ResultIndexSummary: Sendable {

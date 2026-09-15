@@ -3,6 +3,85 @@ import Foundation
 import XCTest
 
 final class CatalogStoreTests: XCTestCase {
+    func testEmbeddingCacheRequiresCurrentSourceFingerprint() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("IndexPhotosEmbeddingTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let catalog = try CatalogStore(
+            databaseURL: directory.appendingPathComponent("catalog.sqlite")
+        )
+        let rootID = UUID()
+        try await catalog.upsertRoot(
+            id: rootID,
+            displayName: "test",
+            url: directory,
+            bookmarkData: nil
+        )
+        let sessionID = try await catalog.createScanSession(rootID: rootID)
+        let item = DiscoveredPhoto(
+            assetID: "asset-embedding",
+            rootID: rootID,
+            path: directory.appendingPathComponent("photo.jpg").path,
+            fileResourceID: nil,
+            sourceFingerprint: "source-v1",
+            sizeBytes: 1024,
+            modifiedAt: nil
+        )
+        _ = try await catalog.registerDiscovered(item, sessionID: sessionID)
+        _ = try await catalog.commitFastFeature(
+            sessionID: sessionID,
+            item: item,
+            feature: FastFeatureResult(
+                contentHash: "hash",
+                perceptualHash: 1,
+                thumbnailData: Data([1]),
+                width: 1,
+                height: 1
+            ),
+            thumbnail: ThumbnailObject(
+                key: "thumbnail-embedding",
+                relativePath: "thumbnails/small/embedding.jpg"
+            )
+        )
+
+        let embedding = ImageEmbedding(
+            modelIdentifier: "test-model",
+            algorithmVersion: "test-embedding-v1",
+            metric: "cosine",
+            values: [0.6, 0.8]
+        )
+        try await catalog.commitEmbedding(
+            assetID: item.assetID,
+            sourceFingerprint: item.sourceFingerprint,
+            embedding: embedding
+        )
+
+        let currentEmbedding = try await catalog.validEmbedding(
+            assetID: item.assetID,
+            sourceFingerprint: item.sourceFingerprint,
+            algorithmVersion: embedding.algorithmVersion
+        )
+        XCTAssertEqual(currentEmbedding, embedding)
+
+        let staleEmbedding = try await catalog.validEmbedding(
+            assetID: item.assetID,
+            sourceFingerprint: "source-v2",
+            algorithmVersion: embedding.algorithmVersion
+        )
+        XCTAssertNil(staleEmbedding)
+
+        let inputs = try await catalog.embeddingInputs()
+        XCTAssertEqual(inputs.map(\.assetID), [item.assetID])
+        let indexed = try await catalog.committedEmbeddings(
+            algorithmVersion: embedding.algorithmVersion
+        )
+        XCTAssertEqual(indexed.map(\.assetID), [item.assetID])
+
+        try await catalog.close()
+    }
+
     func testQuickFingerprintCandidateCanBePromotedToFullHash() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("IndexPhotosQuickFingerprintTests-\(UUID().uuidString)", isDirectory: true)
@@ -453,6 +532,56 @@ final class CatalogStoreTests: XCTestCase {
         XCTAssertEqual(summary.similarityCandidateCount, 2)
         XCTAssertEqual(storedSummary.duplicateGroupCount, 1)
         XCTAssertEqual(storedSummary.similarityCandidateCount, 2)
+
+        let initialCandidates = try await catalog.similarityCandidates(
+            rootID: rootID
+        )
+        XCTAssertEqual(initialCandidates.count, 2)
+        let geometryEvidence = #"{"geometry":{"algorithm":"test-geometry-v1","status":"completed"}}"#
+        let geometryCandidate = try XCTUnwrap(initialCandidates.first)
+        try await catalog.updateSimilarityEvidence(
+            candidateID: geometryCandidate.id,
+            evidenceJSON: geometryEvidence
+        )
+        _ = try await indexer.rebuild()
+        let rebuiltCandidates = try await catalog.similarityCandidates(
+            rootID: rootID,
+            includeReviewed: true
+        )
+        XCTAssertEqual(
+            rebuiltCandidates.first(where: { $0.id == geometryCandidate.id })?.evidenceJSON,
+            geometryEvidence
+        )
+
+        let pendingCandidates = try await catalog.similarityCandidates(
+            rootID: rootID
+        )
+        XCTAssertEqual(pendingCandidates.count, 2)
+        let reviewedCandidate = try XCTUnwrap(pendingCandidates.first)
+        try await catalog.setReviewDecision(
+            candidateID: reviewedCandidate.id,
+            decision: .process,
+            note: "待后续人工处理"
+        )
+
+        let remainingCandidates = try await catalog.similarityCandidates(
+            rootID: rootID
+        )
+        XCTAssertEqual(remainingCandidates.count, 1)
+
+        let allCandidates = try await catalog.similarityCandidates(
+            rootID: rootID,
+            includeReviewed: true
+        )
+        XCTAssertEqual(allCandidates.count, 2)
+        XCTAssertEqual(
+            allCandidates.first(where: { $0.id == reviewedCandidate.id })?.decision,
+            .process
+        )
+
+        try await catalog.clearReviewDecision(candidateID: reviewedCandidate.id)
+        let clearedCandidates = try await catalog.similarityCandidates(rootID: rootID)
+        XCTAssertEqual(clearedCandidates.count, 2)
 
         try await catalog.close()
     }

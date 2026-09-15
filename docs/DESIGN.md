@@ -121,7 +121,7 @@ feature_key = asset_id + source_fingerprint + feature_kind + algorithm_version
 1. `prepare`：取得目录权限、加载缓存、恢复异常会话。
 2. `enumerate`：递归枚举图片文件，只读取 URL 资源属性，不读取完整文件内容。
 3. `fast_features`：按大小分组，计算 BLAKE3、鲁棒缩略图哈希、尺寸和 EXIF。
-4. `embedding`：对需要高召回的照片计算一次 image-copy embedding；快速模式只处理疑难候选。
+4. `embedding`：对需要高召回的照片计算一次 image-copy embedding；当前默认后端为可替换的 Vision Feature Print revision 2，快速模式只处理疑难候选。
 5. `index`：从已持久化的 embedding 建立或更新 HNSW。
 6. `verify`：只对 pHash/HNSW 找出的少量候选执行 ORB/SIFT + RANSAC，并区分重复关系和相似关系。
 7. `finalize`：生成精确重复组和相似候选，标记消失文件、清理临时任务和过期缓存。
@@ -222,7 +222,7 @@ discovered → pending → processing → staged → committed
 
 ### 7.3 向量检索
 
-优先验证 SSCD 或兼容的 image-copy detection 模型。此类模型是“同图变换”检索模型，比通用语义相似度更适合作为近重复照片候选器。模型输入和输出规范写入 manifest；向量归一化后使用 cosine 距离，建立全局 HNSW 近邻索引。
+优先验证 SSCD 或兼容的 image-copy detection 模型。此类模型是“同图变换”检索模型，比通用语义相似度更适合作为近重复照片候选器。当前实现使用可替换的 Vision Feature Print revision 2 后端；模型输入和输出规范写入特征记录，向量归一化后使用 cosine 距离，建立全局 HNSW 近邻索引。
 
 默认每张照片保存一个主 embedding。只有主向量处在候选边界、检测到明显裁剪，或照片属于需要高召回的模式时，才从已经缓存的缩略图在内存中生成亮度归一化、灰度或多裁剪视图，并保存可选辅助向量。辅助向量使用独立的 `embedding_variant` 标识，不能与不同预处理的主向量混为同一指标。
 
@@ -234,7 +234,9 @@ HNSW 是派生索引：
 - 新索引在 `vectors/generations/<id>/` 中构建；
 - 写入 `READY` 和校验元数据后，原子替换 `vectors/CURRENT`；
 - 构建中断时保留旧索引，恢复时可从 SQLite embedding 重建，不读取原图；
-- 删除使用 tombstone，达到阈值后生成新一代索引。
+- 旧代际只保留有限数量，达到阈值后清理，当前代际始终保留。
+
+当前实现已将 Rust HNSW 图、模型信息、源指纹和校验摘要写入 generation；索引损坏时只需清除当前代际并从 SQLite 向量重建。
 
 ### 7.4 几何复核
 
@@ -341,6 +343,8 @@ HNSW 是派生索引：
 7. 建立修图鲁棒性测试集，覆盖 JPEG 重压缩、缩放、曝光/白平衡、裁剪、旋转、镜像、边框、水印、去污、磨皮、局部涂抹和滤镜，并分别测量召回率、误报率、几何复核耗时。
 
 第一阶段完成的最低验收条件：扫描中途强制退出后，重新打开应用可以显示上次会话；点击继续后不重新处理已提交文件；缓存或 HNSW 损坏时可重建；同一照片经过亮度调整、去污和磨皮后仍能进入候选；原始照片不会因缓存清理或索引删除而被删除。
+
+当前几何复核先使用缩略图上的归一化局部 patch 与 affine RANSAC，结果作为候选证据写入 SQLite；后续可替换为 ORB/SIFT，不改变候选与人工审核接口。
 
 ## 13. 研究依据
 

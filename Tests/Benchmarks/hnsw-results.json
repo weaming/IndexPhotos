@@ -1,0 +1,78 @@
+{
+  "date": "2026-09-16",
+  "timezone": "Asia/Hong_Kong",
+  "arch": "arm64",
+  "compiler": "rustc --edition=2024 --test -O",
+  "dataset": "Deterministic normalized synthetic photo clusters, 32 vectors per cluster; 100 perturbed queries, exact top-24 reference",
+  "construction_ef": 96,
+  "max_neighbors": 16,
+  "memory_note": "Estimated allocated graph storage; excludes allocator overhead, source vectors, query heaps and thread-local visited marks (4 bytes per node per search thread, plus spare capacity)",
+  "comparisons": [
+    {
+      "count": 10000,
+      "dimension": 128,
+      "search_ef": 96,
+      "before": {
+        "build_seconds": 1.051,
+        "query_p50_microseconds": 54.0,
+        "query_p95_microseconds": 75.2,
+        "recall_at_24_percent": 69.88,
+        "graph_mib": 16.21
+      },
+      "after": {
+        "build_seconds": 0.348,
+        "query_p50_microseconds": 32.0,
+        "query_p95_microseconds": 47.9,
+        "recall_at_24_percent": 99.12,
+        "graph_mib": 7.24
+      }
+    },
+    {
+      "count": 100000,
+      "dimension": 128,
+      "search_ef": 96,
+      "before": {
+        "build_seconds": 14.822,
+        "query_p50_microseconds": 176.8,
+        "query_p95_microseconds": 897.1,
+        "recall_at_24_percent": 41.62,
+        "graph_mib": 153.68
+      },
+      "after": {
+        "build_seconds": 4.600,
+        "query_p50_microseconds": 75.0,
+        "query_p95_microseconds": 113.3,
+        "recall_at_24_percent": 84.12,
+        "graph_mib": 70.71
+      }
+    }
+  ],
+  "additional_runs": [
+    {
+      "count": 100000,
+      "dimension": 128,
+      "search_ef": 192,
+      "query_p50_microseconds": 132.6,
+      "query_p95_microseconds": 189.8,
+      "recall_at_24_percent": 88.92
+    },
+    {
+      "count": 100000,
+      "dimension": 128,
+      "search_ef": 384,
+      "query_p50_microseconds": 288.0,
+      "query_p95_microseconds": 383.5,
+      "recall_at_24_percent": 95.17
+    },
+    {
+      "count": 10000,
+      "dimension": 768,
+      "search_ef": 96,
+      "build_seconds": 1.682,
+      "query_p50_microseconds": 301.8,
+      "query_p95_microseconds": 395.8,
+      "recall_at_24_percent": 100.00,
+      "graph_mib": 31.66
+    }
+  ]
+}

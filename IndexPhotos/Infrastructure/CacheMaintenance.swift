@@ -3,10 +3,20 @@ import Foundation
 actor CacheMaintenance {
     private let catalog: CatalogStore
     private let thumbnailStore: ThumbnailStore
+    private let vectorStore: VectorGenerationStore?
 
-    init(catalog: CatalogStore, thumbnailStore: ThumbnailStore) {
+    init(
+        catalog: CatalogStore,
+        thumbnailStore: ThumbnailStore,
+        cacheRoot: CacheRoot? = nil
+    ) {
         self.catalog = catalog
         self.thumbnailStore = thumbnailStore
+        if let cacheRoot {
+            vectorStore = VectorGenerationStore(cacheRoot: cacheRoot)
+        } else {
+            vectorStore = nil
+        }
     }
 
     func removeUnreferencedObjects(limit: Int = 128) async throws -> Int {
@@ -25,6 +35,14 @@ actor CacheMaintenance {
             }
         }
 
+        if let vectorStore {
+            do {
+                _ = try vectorStore.loadCurrent()
+            } catch {
+                try vectorStore.clearCurrent()
+            }
+            removedCount += try vectorStore.removeSupersededGenerations()
+        }
         return removedCount
     }
 }

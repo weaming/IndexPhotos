@@ -7,6 +7,7 @@ struct CachePaths: Sendable {
     let database: URL
     let vectors: URL
     let vectorGenerations: URL
+    let vectorCurrent: URL
     let thumbnails: URL
     let smallThumbnails: URL
     let mediumThumbnails: URL
@@ -22,6 +23,7 @@ struct CachePaths: Sendable {
         database = root.appendingPathComponent("catalog.sqlite")
         vectors = root.appendingPathComponent("vectors", isDirectory: true)
         vectorGenerations = root.appendingPathComponent("vectors/generations", isDirectory: true)
+        vectorCurrent = root.appendingPathComponent("vectors/CURRENT")
         thumbnails = root.appendingPathComponent("thumbnails", isDirectory: true)
         smallThumbnails = root.appendingPathComponent("thumbnails/small", isDirectory: true)
         mediumThumbnails = root.appendingPathComponent("thumbnails/medium", isDirectory: true)

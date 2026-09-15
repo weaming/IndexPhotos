@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -186,30 +187,291 @@ private struct ScanDashboardView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(model.selectedRootURL?.lastPathComponent ?? "照片目录")
-                    .font(.largeTitle)
-                    .bold()
-                Text(model.statusMessage)
-                    .foregroundStyle(.secondary)
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(model.selectedRootURL?.lastPathComponent ?? "照片目录")
+                        .font(.largeTitle)
+                        .bold()
+                    Text(model.statusMessage)
+                        .foregroundStyle(.secondary)
+                }
+
+                ProgressPanel(snapshot: model.currentProgress)
+
+                if let lastPath = model.currentProgress.lastPath {
+                    GroupBox("最近处理") {
+                        Text(lastPath)
+                            .font(.callout.monospaced())
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+
+                SimilarityCandidatesPanel()
             }
+            .padding(32)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .task(id: model.selectedRootID) {
+            model.refreshSimilarityCandidates()
+        }
+    }
+}
 
-            ProgressPanel(snapshot: model.currentProgress)
+private struct SimilarityCandidatesPanel: View {
+    @Environment(AppModel.self) private var model
 
-            if let lastPath = model.currentProgress.lastPath {
-                GroupBox("最近处理") {
-                    Text(lastPath)
-                        .font(.callout.monospaced())
-                        .textSelection(.enabled)
+    var body: some View {
+        GroupBox("相似候选") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text(
+                        model.showReviewedSimilarityCandidates
+                            ? "显示全部候选"
+                            : "待人工处理 \(model.similarityCandidates.count) 项"
+                    )
+                    .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Button {
+                        model.showReviewedSimilarityCandidates.toggle()
+                        model.refreshSimilarityCandidates()
+                    } label: {
+                        Label(
+                            model.showReviewedSimilarityCandidates
+                                ? "仅显示待处理"
+                                : "显示已审核",
+                            systemImage: "line.3.horizontal.decrease.circle"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                if model.isLoadingSimilarityCandidates {
+                    ProgressView("正在读取相似候选…")
                         .frame(maxWidth: .infinity, alignment: .leading)
+                } else if model.similarityCandidates.isEmpty {
+                    ContentUnavailableView {
+                        Label("暂无相似候选", systemImage: "checkmark.circle")
+                    } description: {
+                        Text(
+                            model.showReviewedSimilarityCandidates
+                                ? "当前目录还没有可查看的相似照片。"
+                                : "新发现的轻微修改、裁剪或曝光变化会出现在这里。"
+                        )
+                    }
+                    .frame(maxWidth: .infinity)
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(model.similarityCandidates) { candidate in
+                            SimilarityCandidateRow(
+                                candidate: candidate,
+                                thumbnailRootURL: model.thumbnailCacheURL,
+                                onDecision: { decision in
+                                    model.reviewCandidate(
+                                        candidate.id,
+                                        decision: decision
+                                    )
+                                },
+                                onClearDecision: {
+                                    model.clearReviewDecision(candidate.id)
+                                }
+                            )
+                        }
+                    }
                 }
             }
-
-            Spacer()
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(32)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+private struct SimilarityCandidateRow: View {
+    let candidate: SimilarityReviewItem
+    let thumbnailRootURL: URL?
+    let onDecision: (ReviewDecision) -> Void
+    let onClearDecision: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 16) {
+                CandidatePhotoCard(
+                    path: candidate.assetAPath,
+                    thumbnailRootURL: thumbnailRootURL,
+                    thumbnailRelativePath: candidate.thumbnailARelativePath
+                )
+
+                Image(systemName: "arrow.left.and.right")
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 72)
+                    .accessibilityHidden(true)
+
+                CandidatePhotoCard(
+                    path: candidate.assetBPath,
+                    thumbnailRootURL: thumbnailRootURL,
+                    thumbnailRelativePath: candidate.thumbnailBRelativePath
+                )
+            }
+
+            HStack(spacing: 12) {
+                Text(
+                    "相似度 \(candidate.score, format: .number.precision(.fractionLength(2)))"
+                )
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+
+                Text(candidate.relationKind)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                if let decision = candidate.decision {
+                    Text(reviewDecisionTitle(decision))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Button("取消标记") {
+                        onClearDecision()
+                    }
+                } else {
+                    Button("保留") {
+                        onDecision(.keep)
+                    }
+                    Button("后续处理") {
+                        onDecision(.process)
+                    }
+                    Button("忽略") {
+                        onDecision(.ignore)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func reviewDecisionTitle(_ decision: ReviewDecision) -> String {
+        switch decision {
+        case .keep:
+            return "已保留"
+        case .process:
+            return "已标记后续处理"
+        case .ignore:
+            return "已忽略"
+        }
+    }
+}
+
+private struct CandidatePhotoCard: View {
+    let path: String
+    let thumbnailRootURL: URL?
+    let thumbnailRelativePath: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            CachedThumbnailView(
+                cacheRootURL: thumbnailRootURL,
+                relativePath: thumbnailRelativePath
+            )
+
+            Text(URL(fileURLWithPath: path).lastPathComponent)
+                .font(.headline)
+                .lineLimit(1)
+                .help(path)
+
+            Text(path)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .textSelection(.enabled)
+
+            Button("在 Finder 中显示") {
+                NSWorkspace.shared.activateFileViewerSelecting([
+                    URL(fileURLWithPath: path)
+                ])
+            }
+            .buttonStyle(.link)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct CachedThumbnailView: View {
+    let cacheRootURL: URL?
+    let relativePath: String?
+
+    @State private var image: NSImage?
+    @State private var hasLoadFailed = false
+
+    var body: some View {
+        ZStack {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .accessibilityLabel("照片缩略图")
+            } else {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(.quaternary)
+                if hasLoadFailed {
+                    Label("缩略图不可用", systemImage: "photo.badge.exclamationmark")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ProgressView()
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 170)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .task(id: thumbnailURL?.path) {
+            await loadImage()
+        }
+    }
+
+    private var thumbnailURL: URL? {
+        guard let cacheRootURL,
+              let relativePath,
+              !relativePath.isEmpty
+        else {
+            return nil
+        }
+
+        let rootPath = cacheRootURL.standardizedFileURL.path
+        let fileURL = cacheRootURL
+            .appendingPathComponent(relativePath)
+            .standardizedFileURL
+        guard fileURL.path.hasPrefix(rootPath + "/") else {
+            return nil
+        }
+        return fileURL
+    }
+
+    private func loadImage() async {
+        image = nil
+        hasLoadFailed = false
+        guard let thumbnailURL else {
+            hasLoadFailed = true
+            return
+        }
+
+        do {
+            let data = try await Task.detached(priority: .utility) {
+                try Data(contentsOf: thumbnailURL, options: [.mappedIfSafe])
+            }.value
+            guard !Task.isCancelled else {
+                return
+            }
+            guard let decodedImage = NSImage(data: data) else {
+                hasLoadFailed = true
+                return
+            }
+            image = decodedImage
+        } catch {
+            hasLoadFailed = true
+        }
     }
 }
 

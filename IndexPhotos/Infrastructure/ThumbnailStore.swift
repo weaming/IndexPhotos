@@ -83,6 +83,22 @@ struct ThumbnailStore: Sendable {
         return FileManager.default.fileExists(atPath: fileURL.path)
     }
 
+    func load(relativePath: String) throws -> Data {
+        let rootPath = paths.root.standardizedFileURL.path
+        let fileURL = paths.root.appendingPathComponent(relativePath)
+            .standardizedFileURL
+        guard fileURL.path.hasPrefix(rootPath + "/") else {
+            throw IndexPhotosError.invalidState("缓存对象路径越界：\(relativePath)")
+        }
+        do {
+            return try Data(contentsOf: fileURL, options: [.mappedIfSafe])
+        } catch {
+            throw IndexPhotosError.invalidState(
+                "无法读取缓存缩略图：\(relativePath)（\(error.localizedDescription)）"
+            )
+        }
+    }
+
     private func makeObjectKey(
         assetID: String,
         sourceFingerprint: String

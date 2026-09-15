@@ -350,6 +350,163 @@ actor CatalogStore {
         return features
     }
 
+    func embeddingInputs() throws -> [EmbeddingInput] {
+        let statement = try prepare(
+            """
+            SELECT a.id, a.source_fingerprint, f.value
+            FROM assets AS a
+            JOIN asset_features AS f ON f.asset_id = a.id
+            WHERE a.state = 'active'
+              AND f.feature_kind = 'fast_features'
+              AND f.algorithm_version = 'fast-v1';
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        var inputs: [EmbeddingInput] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW else {
+                throw IndexPhotosError.database("读取向量输入失败")
+            }
+            guard let assetID = columnText(statement, index: 0),
+                  let sourceFingerprint = columnText(statement, index: 1),
+                  let value = columnData(statement, index: 2),
+                  let record = try? JSONDecoder().decode(FastFeatureRecord.self, from: value),
+                  record.sourceFingerprint == sourceFingerprint,
+                  !record.thumbnailRelativePath.isEmpty
+            else {
+                continue
+            }
+            inputs.append(
+                EmbeddingInput(
+                    assetID: assetID,
+                    sourceFingerprint: sourceFingerprint,
+                    thumbnailRelativePath: record.thumbnailRelativePath
+                )
+            )
+        }
+        return inputs.sorted { $0.assetID < $1.assetID }
+    }
+
+    func validEmbedding(
+        assetID: String,
+        sourceFingerprint: String,
+        algorithmVersion: String
+    ) throws -> ImageEmbedding? {
+        let statement = try prepare(
+            """
+            SELECT value
+            FROM asset_features
+            WHERE asset_id = ? AND feature_kind = 'embedding'
+              AND algorithm_version = ?
+            LIMIT 1;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        try bind(assetID, at: 1, to: statement)
+        try bind(algorithmVersion, at: 2, to: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              let value = columnData(statement, index: 0),
+              let record = try? JSONDecoder().decode(EmbeddingFeatureRecord.self, from: value),
+              record.sourceFingerprint == sourceFingerprint,
+              record.algorithmVersion == algorithmVersion
+        else {
+            return nil
+        }
+        return record.embedding
+    }
+
+    func commitEmbedding(
+        assetID: String,
+        sourceFingerprint: String,
+        embedding: ImageEmbedding
+    ) throws {
+        let record = EmbeddingFeatureRecord(
+            sourceFingerprint: sourceFingerprint,
+            embedding: embedding
+        )
+        let encodedRecord = try JSONEncoder().encode(record)
+
+        let assetStatement = try prepare(
+            """
+            SELECT source_fingerprint
+            FROM assets
+            WHERE id = ? AND state = 'active'
+            LIMIT 1;
+            """
+        )
+        defer { sqlite3_finalize(assetStatement) }
+        try bind(assetID, at: 1, to: assetStatement)
+        guard sqlite3_step(assetStatement) == SQLITE_ROW,
+              columnText(assetStatement, index: 0) == sourceFingerprint
+        else {
+            throw IndexPhotosError.invalidState("无法提交过期图片向量：\(assetID)")
+        }
+
+        try execute("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            try upsertFeature(
+                assetID: assetID,
+                featureKind: "embedding",
+                algorithmVersion: embedding.algorithmVersion,
+                value: encodedRecord
+            )
+            try execute("COMMIT;")
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
+    func committedEmbeddings(algorithmVersion: String) throws -> [IndexedEmbedding] {
+        let statement = try prepare(
+            """
+            SELECT a.id, a.source_fingerprint, a.content_hash, f.value
+            FROM assets AS a
+            JOIN asset_features AS f ON f.asset_id = a.id
+            WHERE a.state = 'active'
+              AND f.feature_kind = 'embedding'
+              AND f.algorithm_version = ?;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(algorithmVersion, at: 1, to: statement)
+
+        var embeddings: [IndexedEmbedding] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW else {
+                throw IndexPhotosError.database("读取已提交图片向量失败")
+            }
+            guard let assetID = columnText(statement, index: 0),
+                  let sourceFingerprint = columnText(statement, index: 1),
+                  let value = columnData(statement, index: 3),
+                  let record = try? JSONDecoder().decode(EmbeddingFeatureRecord.self, from: value),
+                  record.sourceFingerprint == sourceFingerprint,
+                  record.algorithmVersion == algorithmVersion
+            else {
+                continue
+            }
+            embeddings.append(
+                IndexedEmbedding(
+                    assetID: assetID,
+                    sourceFingerprint: sourceFingerprint,
+                    contentHash: columnText(statement, index: 2),
+                    embedding: record.embedding
+                )
+            )
+        }
+        return embeddings.sorted { $0.assetID < $1.assetID }
+    }
+
     func markMissingAssets(
         rootID: UUID,
         sessionID: UUID
@@ -537,6 +694,30 @@ actor CatalogStore {
         do {
             try execute(
                 """
+                CREATE TEMP TABLE IF NOT EXISTS current_similarity_candidates (
+                    id TEXT PRIMARY KEY NOT NULL
+                );
+                DELETE FROM current_similarity_candidates;
+                """
+            )
+            let currentCandidateStatement = try prepare(
+                """
+                INSERT OR IGNORE INTO current_similarity_candidates (id)
+                VALUES (?);
+                """
+            )
+            defer { sqlite3_finalize(currentCandidateStatement) }
+            for candidate in candidates {
+                guard sqlite3_reset(currentCandidateStatement) == SQLITE_OK else {
+                    throw IndexPhotosError.database("重置相似候选临时语句失败")
+                }
+                sqlite3_clear_bindings(currentCandidateStatement)
+                try bind(candidate.id, at: 1, to: currentCandidateStatement)
+                try step(currentCandidateStatement)
+            }
+
+            try execute(
+                """
                 DELETE FROM duplicate_members
                 WHERE group_id IN (
                     SELECT id FROM duplicate_groups
@@ -550,7 +731,10 @@ actor CatalogStore {
             try execute(
                 """
                 DELETE FROM similarity_candidates
-                WHERE algorithm_version = 'fast-phash-v1'
+                WHERE algorithm_version IN ('fast-phash-v1', 'vision-hnsw-v1')
+                  AND id NOT IN (
+                      SELECT id FROM current_similarity_candidates
+                  )
                   AND id NOT IN (
                       SELECT candidate_id FROM review_decisions
                   );
@@ -566,6 +750,7 @@ actor CatalogStore {
             for candidate in candidates {
                 try upsertSimilarityCandidate(candidate)
             }
+            try execute("DELETE FROM current_similarity_candidates;")
             try execute("COMMIT;")
         } catch {
             try? execute("ROLLBACK;")
@@ -580,7 +765,7 @@ actor CatalogStore {
                 (SELECT COUNT(*) FROM duplicate_groups
                  WHERE algorithm_version = 'exact-v1'),
                 (SELECT COUNT(*) FROM similarity_candidates
-                 WHERE algorithm_version = 'fast-phash-v1');
+                 WHERE algorithm_version IN ('fast-phash-v1', 'vision-hnsw-v1'));
             """
         )
         defer { sqlite3_finalize(statement) }
@@ -592,6 +777,171 @@ actor CatalogStore {
             duplicateGroupCount: Int(sqlite3_column_int64(statement, 0)),
             similarityCandidateCount: Int(sqlite3_column_int64(statement, 1))
         )
+    }
+
+    func similarityCandidates(
+        rootID: UUID? = nil,
+        includeReviewed: Bool = false,
+        limit: Int = 500
+    ) throws -> [SimilarityReviewItem] {
+        let statement = try prepare(
+            """
+            SELECT
+                c.id,
+                a.id, a.path, a.source_fingerprint, fa.value,
+                b.id, b.path, b.source_fingerprint, fb.value,
+                c.relation_kind, c.score, c.evidence_json,
+                c.algorithm_version, d.decision
+            FROM similarity_candidates AS c
+            JOIN assets AS a ON a.id = c.asset_a_id
+            JOIN assets AS b ON b.id = c.asset_b_id
+            LEFT JOIN asset_features AS fa
+                ON fa.asset_id = a.id
+               AND fa.feature_kind = 'fast_features'
+               AND fa.algorithm_version = 'fast-v1'
+            LEFT JOIN asset_features AS fb
+                ON fb.asset_id = b.id
+               AND fb.feature_kind = 'fast_features'
+               AND fb.algorithm_version = 'fast-v1'
+            LEFT JOIN review_decisions AS d ON d.candidate_id = c.id
+            WHERE a.state = 'active'
+              AND b.state = 'active'
+              AND (? IS NULL OR a.root_id = ?)
+              AND (? = 1 OR d.decision IS NULL)
+            ORDER BY c.score DESC, c.id ASC
+            LIMIT ?;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        let rootValue = rootID?.uuidString
+        try bind(rootValue, at: 1, to: statement)
+        try bind(rootValue, at: 2, to: statement)
+        try bind(Int64(includeReviewed ? 1 : 0), at: 3, to: statement)
+        try bind(Int64(max(limit, 0)), at: 4, to: statement)
+
+        var candidates: [SimilarityReviewItem] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW else {
+                throw IndexPhotosError.database("读取相似候选失败")
+            }
+            guard let candidateID = columnText(statement, index: 0),
+                  let assetAID = columnText(statement, index: 1),
+                  let assetAPath = columnText(statement, index: 2),
+                  let assetASourceFingerprint = columnText(statement, index: 3),
+                  let assetBID = columnText(statement, index: 5),
+                  let assetBPath = columnText(statement, index: 6),
+                  let assetBSourceFingerprint = columnText(statement, index: 7),
+                  let relationKind = columnText(statement, index: 9),
+                  let evidenceJSON = columnText(statement, index: 11),
+                  let algorithmVersion = columnText(statement, index: 12)
+            else {
+                continue
+            }
+
+            let decision: ReviewDecision?
+            if let decisionValue = columnText(statement, index: 13) {
+                guard let decodedDecision = ReviewDecision(rawValue: decisionValue) else {
+                    throw IndexPhotosError.database("未知审核决定：\(decisionValue)")
+                }
+                decision = decodedDecision
+            } else {
+                decision = nil
+            }
+
+            let thumbnailAPath = decodeThumbnailPath(
+                from: columnData(statement, index: 4)
+            )
+            let thumbnailBPath = decodeThumbnailPath(
+                from: columnData(statement, index: 8)
+            )
+            candidates.append(
+                SimilarityReviewItem(
+                    id: candidateID,
+                    assetAID: assetAID,
+                    assetAPath: assetAPath,
+                    assetASourceFingerprint: assetASourceFingerprint,
+                    thumbnailARelativePath: thumbnailAPath,
+                    assetBID: assetBID,
+                    assetBPath: assetBPath,
+                    assetBSourceFingerprint: assetBSourceFingerprint,
+                    thumbnailBRelativePath: thumbnailBPath,
+                    relationKind: relationKind,
+                    score: sqlite3_column_double(statement, 10),
+                    evidenceJSON: evidenceJSON,
+                    algorithmVersion: algorithmVersion,
+                    decision: decision
+                )
+            )
+        }
+        return candidates
+    }
+
+    func updateSimilarityEvidence(
+        candidateID: String,
+        evidenceJSON: String
+    ) throws {
+        let statement = try prepare(
+            """
+            UPDATE similarity_candidates
+            SET evidence_json = ?
+            WHERE id = ?;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(evidenceJSON, at: 1, to: statement)
+        try bind(candidateID, at: 2, to: statement)
+        try step(statement)
+        guard sqlite3_changes(database) > 0 else {
+            throw IndexPhotosError.invalidState("相似候选不存在：\(candidateID)")
+        }
+    }
+
+    func setReviewDecision(
+        candidateID: String,
+        decision: ReviewDecision,
+        note: String? = nil
+    ) throws {
+        guard let database else {
+            throw IndexPhotosError.database("数据库连接已关闭")
+        }
+        let statement = try prepare(
+            """
+            INSERT INTO review_decisions (
+                candidate_id, decision, note, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(candidate_id) DO UPDATE SET
+                decision = excluded.decision,
+                note = excluded.note,
+                updated_at = excluded.updated_at;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        try bind(candidateID, at: 1, to: statement)
+        try bind(decision.rawValue, at: 2, to: statement)
+        try bind(note, at: 3, to: statement)
+        try bind(timestamp(.now), at: 4, to: statement)
+        try step(statement)
+        guard sqlite3_changes(database) > 0 else {
+            throw IndexPhotosError.invalidState("相似候选不存在：\(candidateID)")
+        }
+    }
+
+    func clearReviewDecision(candidateID: String) throws {
+        let statement = try prepare(
+            """
+            DELETE FROM review_decisions
+            WHERE candidate_id = ?;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(candidateID, at: 1, to: statement)
+        try step(statement)
     }
 
     func recordFeatureFailure(
@@ -1043,6 +1393,7 @@ actor CatalogStore {
 
     private func upsertFeature(
         assetID: String,
+        featureKind: String = "fast_features",
         algorithmVersion: String,
         value: Data
     ) throws {
@@ -1050,7 +1401,7 @@ actor CatalogStore {
             """
             INSERT INTO asset_features (
                 asset_id, feature_kind, algorithm_version, value, created_at
-            ) VALUES (?, 'fast_features', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(asset_id, feature_kind, algorithm_version) DO UPDATE SET
                 value = excluded.value,
                 created_at = excluded.created_at;
@@ -1059,9 +1410,10 @@ actor CatalogStore {
         defer { sqlite3_finalize(statement) }
 
         try bind(assetID, at: 1, to: statement)
-        try bind(algorithmVersion, at: 2, to: statement)
-        try bind(value, at: 3, to: statement)
-        try bind(timestamp(.now), at: 4, to: statement)
+        try bind(featureKind, at: 2, to: statement)
+        try bind(algorithmVersion, at: 3, to: statement)
+        try bind(value, at: 4, to: statement)
+        try bind(timestamp(.now), at: 5, to: statement)
         try step(statement)
     }
 
@@ -1085,6 +1437,16 @@ actor CatalogStore {
         guard sqlite3_step(statement) == SQLITE_ROW,
               let data = columnData(statement, index: 0),
               let record = try? JSONDecoder().decode(FastFeatureRecord.self, from: data)
+        else {
+            return nil
+        }
+        return record.thumbnailRelativePath
+    }
+
+    private func decodeThumbnailPath(from data: Data?) -> String? {
+        guard let data,
+              let record = try? JSONDecoder().decode(FastFeatureRecord.self, from: data),
+              !record.thumbnailRelativePath.isEmpty
         else {
             return nil
         }
@@ -1201,7 +1563,11 @@ actor CatalogStore {
             ON CONFLICT(asset_a_id, asset_b_id, algorithm_version) DO UPDATE SET
                 relation_kind = excluded.relation_kind,
                 score = excluded.score,
-                evidence_json = excluded.evidence_json,
+                evidence_json = CASE
+                    WHEN instr(similarity_candidates.evidence_json, '"geometry"') > 0
+                    THEN similarity_candidates.evidence_json
+                    ELSE excluded.evidence_json
+                END,
                 created_at = excluded.created_at;
             """
         )

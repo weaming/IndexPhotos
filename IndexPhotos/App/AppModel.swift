@@ -13,11 +13,16 @@ final class AppModel {
     var selectedRootID: UUID?
     var resumableScan: ResumableScan?
     var isScanTaskActive = false
+    var similarityCandidates: [SimilarityReviewItem] = []
+    var isLoadingSimilarityCandidates = false
+    var showReviewedSimilarityCandidates = false
 
     private let catalog: CatalogStore?
     private let coordinator: ScanCoordinator?
     private let cacheRoot: CacheRoot?
     private let cacheMaintenance: CacheMaintenance?
+    let thumbnailCacheURL: URL?
+    @ObservationIgnored private var similarityTask: Task<Void, Never>?
     private var cacheLock: CacheLock?
     private var progressTask: Task<Void, Never>?
 
@@ -49,13 +54,15 @@ final class AppModel {
             resolvedCoordinator = ScanCoordinator(catalog: catalog, cacheRoot: cacheRoot)
             resolvedMaintenance = CacheMaintenance(
                 catalog: catalog,
-                thumbnailStore: ThumbnailStore(cacheRoot: cacheRoot)
+                thumbnailStore: ThumbnailStore(cacheRoot: cacheRoot),
+                cacheRoot: cacheRoot
             )
         } catch {
             initializationError = error
         }
 
         cacheRoot = resolvedCacheRoot
+        thumbnailCacheURL = resolvedCacheRoot?.paths.root
         cacheLock = resolvedLock
         catalog = resolvedCatalog
         coordinator = resolvedCoordinator
@@ -145,6 +152,77 @@ final class AppModel {
         statusMessage = "正在取消，保留已提交结果…"
     }
 
+    func refreshSimilarityCandidates() {
+        guard let catalog else {
+            similarityCandidates = []
+            isLoadingSimilarityCandidates = false
+            return
+        }
+
+        similarityTask?.cancel()
+        isLoadingSimilarityCandidates = true
+        let rootID = selectedRootID
+        let includeReviewed = showReviewedSimilarityCandidates
+        similarityTask = Task { [weak self] in
+            do {
+                let candidates = try await catalog.similarityCandidates(
+                    rootID: rootID,
+                    includeReviewed: includeReviewed
+                )
+                guard !Task.isCancelled else {
+                    return
+                }
+                self?.similarityCandidates = candidates
+                self?.isLoadingSimilarityCandidates = false
+            } catch is CancellationError {
+            } catch {
+                self?.isLoadingSimilarityCandidates = false
+                self?.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func reviewCandidate(_ candidateID: String, decision: ReviewDecision) {
+        guard let catalog else {
+            errorMessage = "审核服务尚未初始化。"
+            return
+        }
+
+        Task { [weak self] in
+            do {
+                try await catalog.setReviewDecision(
+                    candidateID: candidateID,
+                    decision: decision
+                )
+                guard !Task.isCancelled else {
+                    return
+                }
+                self?.refreshSimilarityCandidates()
+            } catch {
+                self?.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func clearReviewDecision(_ candidateID: String) {
+        guard let catalog else {
+            errorMessage = "审核服务尚未初始化。"
+            return
+        }
+
+        Task { [weak self] in
+            do {
+                try await catalog.clearReviewDecision(candidateID: candidateID)
+                guard !Task.isCancelled else {
+                    return
+                }
+                self?.refreshSimilarityCandidates()
+            } catch {
+                self?.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     private func beginScan(
         rootID: UUID,
         rootURL: URL,
@@ -197,6 +275,7 @@ final class AppModel {
                     do {
                         let summary = try await catalog.resultSummary()
                         self?.statusMessage = "扫描完成：\(summary.duplicateGroupCount) 个重复组，\(summary.similarityCandidateCount) 个相似候选"
+                        self?.refreshSimilarityCandidates()
                     } catch {
                         self?.errorMessage = error.localizedDescription
                     }
@@ -235,6 +314,7 @@ final class AppModel {
             } else {
                 statusMessage = "缓存已就绪"
             }
+            refreshSimilarityCandidates()
         } catch {
             errorMessage = error.localizedDescription
             statusMessage = "无法恢复扫描状态"

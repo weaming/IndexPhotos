@@ -3,6 +3,7 @@ import Foundation
 actor ScanCoordinator {
     private let catalog: CatalogStore
     private let thumbnailStore: ThumbnailStore
+    private let embeddingProvider: VisionFeaturePrintProvider
     private let featureExtractor = FastFeatureExtractor()
     private let resultIndexer: ResultIndexer
     private var activeTask: Task<Void, Never>?
@@ -11,13 +12,16 @@ actor ScanCoordinator {
 
     init(catalog: CatalogStore, cacheRoot: CacheRoot) {
         self.catalog = catalog
-        thumbnailStore = ThumbnailStore(cacheRoot: cacheRoot)
-        resultIndexer = ResultIndexer(catalog: catalog)
+        let thumbnailStore = ThumbnailStore(cacheRoot: cacheRoot)
+        self.thumbnailStore = thumbnailStore
+        embeddingProvider = VisionFeaturePrintProvider()
+        resultIndexer = ResultIndexer(catalog: catalog, cacheRoot: cacheRoot)
     }
 
     init(catalog: CatalogStore, thumbnailStore: ThumbnailStore) {
         self.catalog = catalog
         self.thumbnailStore = thumbnailStore
+        embeddingProvider = VisionFeaturePrintProvider()
         resultIndexer = ResultIndexer(catalog: catalog)
     }
 
@@ -182,9 +186,30 @@ actor ScanCoordinator {
             )
             continuation.yield(missingSnapshot)
 
+            try await catalog.markSessionRunning(sessionID, phase: .embedding)
+            try await emitProgress(for: sessionID, continuation: continuation)
+            guard try await buildEmbeddings(
+                continuation: continuation,
+                sessionID: sessionID
+            ) else {
+                return
+            }
+
             try await catalog.markSessionRunning(sessionID, phase: .index)
             try await emitProgress(for: sessionID, continuation: continuation)
             _ = try await resultIndexer.rebuild()
+
+            try await catalog.markSessionRunning(sessionID, phase: .verify)
+            try await emitProgress(for: sessionID, continuation: continuation)
+            guard try await resultIndexer.verifyCandidates(
+                shouldPause: { [weak self] in
+                    await self?.isPauseRequested() ?? false
+                }
+            ) else {
+                let snapshot = try await catalog.pauseSession(sessionID)
+                continuation.yield(snapshot)
+                return
+            }
 
             try await catalog.markSessionRunning(sessionID, phase: .finalize)
             let snapshot = try await catalog.finishEnumeration(
@@ -210,6 +235,59 @@ actor ScanCoordinator {
                 continuation.finish()
             }
         }
+    }
+
+    private func buildEmbeddings(
+        continuation: AsyncStream<ScanProgressSnapshot>.Continuation,
+        sessionID: UUID
+    ) async throws -> Bool {
+        let inputs = try await catalog.embeddingInputs()
+        var lastProgressAt = ContinuousClock.now
+
+        for input in inputs {
+            try Task.checkCancellation()
+            if cancelRequested {
+                throw CancellationError()
+            }
+            if pauseRequested {
+                let snapshot = try await catalog.pauseSession(sessionID)
+                continuation.yield(snapshot)
+                return false
+            }
+
+            if try await catalog.validEmbedding(
+                assetID: input.assetID,
+                sourceFingerprint: input.sourceFingerprint,
+                algorithmVersion: embeddingProvider.algorithmVersion
+            ) != nil {
+                continue
+            }
+
+            do {
+                let thumbnailData = try thumbnailStore.load(
+                    relativePath: input.thumbnailRelativePath
+                )
+                let embedding = try await embeddingProvider.makeEmbedding(
+                    thumbnailData: thumbnailData
+                )
+                try await catalog.commitEmbedding(
+                    assetID: input.assetID,
+                    sourceFingerprint: input.sourceFingerprint,
+                    embedding: embedding
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                continue
+            }
+
+            let now = ContinuousClock.now
+            if lastProgressAt.duration(to: now) >= .milliseconds(250) {
+                lastProgressAt = now
+                try await emitProgress(for: sessionID, continuation: continuation)
+            }
+        }
+        return true
     }
 
     private func process(
@@ -389,5 +467,9 @@ actor ScanCoordinator {
         continuation: AsyncStream<ScanProgressSnapshot>.Continuation
     ) async throws {
         try await continuation.yield(catalog.progress(for: sessionID))
+    }
+
+    private func isPauseRequested() -> Bool {
+        pauseRequested
     }
 }
