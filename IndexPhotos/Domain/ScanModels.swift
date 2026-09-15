@@ -76,11 +76,20 @@ struct ResumableScan: Identifiable, Sendable {
 
 struct FastFeatureRecord: Codable, Sendable {
     let sourceFingerprint: String
-    let contentHash: String
+    let contentHash: String?
+    let quickFingerprint: String?
     let perceptualHash: UInt64
     let thumbnailRelativePath: String
     let width: Int
     let height: Int
+}
+
+struct ContentHashCandidate: Sendable {
+    let assetID: String
+    let path: String
+    let sourceFingerprint: String
+    let contentHash: String?
+    let fileSize: Int64
 }
 
 struct ThumbnailObject: Sendable {
@@ -134,6 +143,19 @@ struct DiscoveredPhoto: Sendable {
 struct ScanRun: Sendable {
     let id: UUID
     let updates: AsyncStream<ScanProgressSnapshot>
+    let metrics: ScanMetrics
+}
+
+actor ScanMetrics {
+    private(set) var sourceBytesRead: Int64 = 0
+
+    func addSourceBytes(_ bytes: Int64) {
+        sourceBytesRead += max(bytes, 0)
+    }
+
+    func snapshot() -> Int64 {
+        sourceBytesRead
+    }
 }
 
 enum IndexPhotosError: LocalizedError {

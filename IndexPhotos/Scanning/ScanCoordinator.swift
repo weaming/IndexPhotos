@@ -39,6 +39,7 @@ actor ScanCoordinator {
         let (updates, continuation) = AsyncStream<ScanProgressSnapshot>.makeStream()
         pauseRequested = false
         cancelRequested = false
+        let metrics = ScanMetrics()
 
         activeTask = Task { [weak self] in
             guard let self else {
@@ -49,11 +50,12 @@ actor ScanCoordinator {
                 sessionID: sessionID,
                 rootID: rootID,
                 rootURL: rootURL,
-                continuation: continuation
+                continuation: continuation,
+                metrics: metrics
             )
         }
 
-        return ScanRun(id: sessionID, updates: updates)
+        return ScanRun(id: sessionID, updates: updates, metrics: metrics)
     }
 
     func requestPause() {
@@ -69,7 +71,8 @@ actor ScanCoordinator {
         sessionID: UUID,
         rootID: UUID,
         rootURL: URL,
-        continuation: AsyncStream<ScanProgressSnapshot>.Continuation
+        continuation: AsyncStream<ScanProgressSnapshot>.Continuation,
+        metrics: ScanMetrics
     ) async {
         defer {
             continuation.finish()
@@ -145,7 +148,8 @@ actor ScanCoordinator {
                         photo,
                         sessionID: sessionID,
                         continuation: continuation,
-                        shouldPublishProgress: canPublishProgress
+                        shouldPublishProgress: canPublishProgress,
+                        metrics: metrics
                     )
                 } catch {
                     try Task.checkCancellation()
@@ -212,7 +216,8 @@ actor ScanCoordinator {
         _ item: DiscoveredPhoto,
         sessionID: UUID,
         continuation: AsyncStream<ScanProgressSnapshot>.Continuation,
-        shouldPublishProgress: Bool
+        shouldPublishProgress: Bool,
+        metrics: ScanMetrics
     ) async throws {
         let registration = try await catalog.registerDiscovered(
             item,
@@ -234,6 +239,11 @@ actor ScanCoordinator {
             if shouldPublishProgress {
                 continuation.yield(snapshot)
             }
+            try await completeContentHashIfNeeded(
+                item: item,
+                quickFingerprint: cachedFeature.quickFingerprint,
+                metrics: metrics
+            )
             return
         }
 
@@ -259,6 +269,7 @@ actor ScanCoordinator {
             } onCancel: {
                 worker.cancel()
             }
+            await metrics.addSourceBytes(result.feature.sourceBytesRead)
         } catch {
             try Task.checkCancellation()
             let snapshot = try await catalog.recordFeatureFailure(
@@ -276,6 +287,68 @@ actor ScanCoordinator {
         )
         if shouldPublishProgress {
             continuation.yield(snapshot)
+        }
+        try await completeContentHashIfNeeded(
+            item: item,
+            quickFingerprint: result.feature.quickFingerprint,
+            metrics: metrics
+        )
+    }
+
+    private func completeContentHashIfNeeded(
+        item: DiscoveredPhoto,
+        quickFingerprint: String?,
+        metrics: ScanMetrics
+    ) async throws {
+        guard let quickFingerprint else { return }
+        let candidates = try await catalog.quickFingerprintCandidates(
+            sizeBytes: item.sizeBytes,
+            quickFingerprint: quickFingerprint,
+            excluding: item.assetID
+        )
+        guard !candidates.isEmpty else { return }
+
+        let currentHash = try await hashContent(item.path, fileSize: item.sizeBytes)
+        await metrics.addSourceBytes(currentHash.sourceBytesRead)
+        try await catalog.completeContentHash(
+            assetID: item.assetID,
+            sourceFingerprint: item.sourceFingerprint,
+            contentHash: currentHash.hash
+        )
+
+        for candidate in candidates where candidate.contentHash == nil {
+            do {
+                let candidateHash = try await hashContent(
+                    candidate.path,
+                    fileSize: candidate.fileSize
+                )
+                await metrics.addSourceBytes(candidateHash.sourceBytesRead)
+                try await catalog.completeContentHash(
+                    assetID: candidate.assetID,
+                    sourceFingerprint: candidate.sourceFingerprint,
+                    contentHash: candidateHash.hash
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                continue
+            }
+        }
+    }
+
+    private func hashContent(_ path: String, fileSize: Int64) async throws -> ContentHashResult {
+        let worker = Task.detached(priority: .utility) { [featureExtractor] in
+            try autoreleasepool {
+                try featureExtractor.hash(
+                    url: URL(fileURLWithPath: path),
+                    fileSize: fileSize
+                )
+            }
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
         }
     }
 

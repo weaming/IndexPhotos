@@ -46,6 +46,23 @@ final class FastFeatureExtractorTests: XCTestCase {
         }
     }
 
+    func testQuickFingerprintReusesReaderCache() throws {
+        let data = Data((0 ..< 200_000).map { UInt8(truncatingIfNeeded: $0) })
+        try withReader(data: data, cacheLimit: data.count) { reader, _ in
+            XCTAssertEqual(reader.skipForward(count: Int64(data.count)), Int64(data.count))
+            _ = try reader.quickFingerprint()
+            XCTAssertEqual(reader.sourceBytesRead, Int64(data.count))
+        }
+    }
+
+    func testOverlappingQuickFingerprintWindowsReadOnce() throws {
+        let data = Data((0 ..< 100_000).map { UInt8(truncatingIfNeeded: $0) })
+        try withReader(data: data, cacheLimit: 0) { reader, _ in
+            _ = try reader.quickFingerprint()
+            XCTAssertEqual(reader.sourceBytesRead, Int64(data.count))
+        }
+    }
+
     func testSameSizeSourceChangeInvalidatesExtraction() throws {
         try withReader(data: Data(repeating: 0, count: 4097), cacheLimit: 8192) { reader, url in
             XCTAssertEqual(reader.skipForward(count: 1), 1)
@@ -111,5 +128,32 @@ final class FastFeatureExtractorTests: XCTestCase {
         XCTAssertFalse(result.thumbnailData.isEmpty)
         XCTAssertGreaterThan(result.width, 0)
         XCTAssertGreaterThan(result.height, 0)
+    }
+
+    func testLargeExtractionDefersFullHash() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("IndexPhotosDeferredHashTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let imageData =
+            try XCTUnwrap(
+                Data(
+                    base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                )
+            )
+        var sourceData = imageData
+        sourceData.append(Data(repeating: 0x5A, count: 5 * 1024 * 1024))
+        let photoURL = directory.appendingPathComponent("large.png")
+        try sourceData.write(to: photoURL)
+
+        let result = try FastFeatureExtractor().extract(
+            url: photoURL,
+            fileSize: Int64(sourceData.count)
+        )
+
+        XCTAssertNil(result.contentHash)
+        XCTAssertNotNil(result.quickFingerprint)
+        XCTAssertFalse(result.thumbnailData.isEmpty)
     }
 }

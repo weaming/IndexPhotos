@@ -1,23 +1,54 @@
 import CoreGraphics
+import CryptoKit
 import Darwin
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
 struct FastFeatureResult: Sendable {
-    let contentHash: String
+    let contentHash: String?
     let perceptualHash: UInt64
     let thumbnailData: Data
     let width: Int
     let height: Int
+    let quickFingerprint: String?
+    let sourceBytesRead: Int64
+
+    init(
+        contentHash: String?,
+        perceptualHash: UInt64,
+        thumbnailData: Data,
+        width: Int,
+        height: Int,
+        quickFingerprint: String? = nil,
+        sourceBytesRead: Int64 = 0
+    ) {
+        self.contentHash = contentHash
+        self.perceptualHash = perceptualHash
+        self.thumbnailData = thumbnailData
+        self.width = width
+        self.height = height
+        self.quickFingerprint = quickFingerprint
+        self.sourceBytesRead = sourceBytesRead
+    }
+}
+
+struct ContentHashResult: Sendable {
+    let hash: String
+    let sourceBytesRead: Int64
 }
 
 struct FastFeatureExtractor {
+    private static let FULL_HASH_MAX_FILE_SIZE = Int64(4 * 1024 * 1024)
     private static let MAX_THUMBNAIL_PIXEL_SIZE = 320
     private static let JPEG_QUALITY = 0.82
 
     func extract(url: URL, fileSize: Int64) throws -> FastFeatureResult {
-        let reader = try StreamingImageReader(url: url, expectedFileSize: fileSize)
+        let reader = try StreamingImageReader(
+            url: url,
+            expectedFileSize: fileSize,
+            hashesSource: fileSize <= Self.FULL_HASH_MAX_FILE_SIZE
+        )
 
         do {
             let result = try extract(reader: reader, url: url)
@@ -35,6 +66,30 @@ struct FastFeatureExtractor {
             }
             try Task.checkCancellation()
             throw extractionError
+        }
+    }
+
+    func hash(url: URL, fileSize: Int64) throws -> ContentHashResult {
+        let reader = try StreamingImageReader(url: url, expectedFileSize: fileSize)
+        do {
+            let contentHash = try reader.finishHashing()
+            try reader.close()
+            return ContentHashResult(
+                hash: contentHash,
+                sourceBytesRead: reader.sourceBytesRead
+            )
+        } catch {
+            let hashingError = error
+            do {
+                try reader.close()
+            } catch {
+                throw FeatureExtractionError.sourceReadFailed(
+                    url,
+                    "\(hashingError.localizedDescription)；关闭文件失败：\(error.localizedDescription)"
+                )
+            }
+            try Task.checkCancellation()
+            throw hashingError
         }
     }
 
@@ -56,22 +111,28 @@ struct FastFeatureExtractor {
             height: rgba.height,
             bytesPerRow: rgba.bytesPerRow
         )
-        let contentHash = try reader.finishHashing()
+        let quickFingerprint = try reader.quickFingerprint()
+        let contentHash = reader.fileSize <= Self.FULL_HASH_MAX_FILE_SIZE
+            ? try reader.finishHashing()
+            : nil
 
         return FastFeatureResult(
             contentHash: contentHash,
             perceptualHash: perceptualHash,
             thumbnailData: thumbnailData,
             width: width > 0 ? width : thumbnail.width,
-            height: height > 0 ? height : thumbnail.height
+            height: height > 0 ? height : thumbnail.height,
+            quickFingerprint: quickFingerprint,
+            sourceBytesRead: reader.sourceBytesRead
         )
     }
 
     private func makeThumbnail(source: CGImageSource) throws -> CGImage {
         let options = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: Self.MAX_THUMBNAIL_PIXEL_SIZE,
+            kCGImageSourceSubsampleFactor: 8,
             kCGImageSourceShouldCache: false,
             kCGImageSourceShouldCacheImmediately: true,
         ] as CFDictionary
@@ -150,6 +211,7 @@ final class StreamingImageReader {
     private let file: FileHandle
     private let url: URL
     private let expectedFileSize: Int64
+    private let hashesSource: Bool
     private let hasher: RustBlake3Hasher
     private let initialFileState: SourceFileState
     private let readChunkSize: Int
@@ -168,11 +230,16 @@ final class StreamingImageReader {
         prefixCache.count
     }
 
+    var fileSize: Int64 {
+        initialFileState.sizeBytes
+    }
+
     init(
         url: URL,
         expectedFileSize: Int64,
         readChunkSize: Int = READ_CHUNK_SIZE,
-        prefixCacheLimit: Int = PREFIX_CACHE_LIMIT
+        prefixCacheLimit: Int = PREFIX_CACHE_LIMIT,
+        hashesSource: Bool = true
     ) throws {
         guard readChunkSize > 0, prefixCacheLimit >= 0 else {
             throw IndexPhotosError.invalidState("读取块大小或缓存上限无效")
@@ -194,6 +261,7 @@ final class StreamingImageReader {
         self.file = file
         self.url = url
         self.expectedFileSize = expectedFileSize
+        self.hashesSource = hashesSource
         self.hasher = hasher
         initialFileState = fileState
         self.readChunkSize = readChunkSize
@@ -256,6 +324,59 @@ final class StreamingImageReader {
         return try hasher.finalize()
     }
 
+    func quickFingerprint() throws -> String {
+        let sampleSize = min(Int64(64 * 1024), initialFileState.sizeBytes)
+        var sample = Data()
+        sample.reserveCapacity(Int(sampleSize * 2) + MemoryLayout<Int64>.size)
+        var size = initialFileState.sizeBytes.bigEndian
+        withUnsafeBytes(of: &size) { sample.append(contentsOf: $0) }
+
+        let sampleWindows: [(offset: Int64, length: Int64)] = if sampleSize == 0 {
+            []
+        } else if initialFileState.sizeBytes <= sampleSize * 2 {
+            [(0, initialFileState.sizeBytes)]
+        } else {
+            [
+                (0, sampleSize),
+                (initialFileState.sizeBytes - sampleSize, sampleSize),
+            ]
+        }
+        for window in sampleWindows {
+            try Task.checkCancellation()
+            if let cachedData = cachedData(offset: window.offset, length: window.length) {
+                sample.append(cachedData)
+                continue
+            }
+
+            try file.seek(toOffset: UInt64(window.offset))
+            physicalOffset = window.offset
+            let data = try file.read(upToCount: Int(window.length)) ?? Data()
+            sourceBytesRead += Int64(data.count)
+            physicalOffset += Int64(data.count)
+            sample.append(data)
+        }
+
+        let finalFileState = try Self.readFileState(file, url: url)
+        guard finalFileState == initialFileState else {
+            throw FeatureExtractionError.sourceReadFailed(url, "文件在扫描期间发生变化。")
+        }
+        return HashEncoding.hex(SHA256.hash(data: sample))
+    }
+
+    private func cachedData(offset: Int64, length: Int64) -> Data? {
+        let endOffset = offset + length
+        if offset >= 0, endOffset <= Int64(prefixCache.count) {
+            return prefixCache.subdata(in: Int(offset) ..< Int(endOffset))
+        }
+
+        let chunkEnd = chunkOffset + Int64(readChunk.count)
+        guard offset >= chunkOffset, endOffset <= chunkEnd else {
+            return nil
+        }
+        let startIndex = Int(offset - chunkOffset)
+        return readChunk.subdata(in: startIndex ..< startIndex + Int(length))
+    }
+
     func readBytes(into buffer: UnsafeMutableRawPointer, count: Int) -> Int {
         guard count > 0, callbackError == nil else {
             return 0
@@ -280,6 +401,21 @@ final class StreamingImageReader {
     func skipForward(count: Int64) -> Int64 {
         guard count > 0, callbackError == nil else {
             return 0
+        }
+
+        if !hashesSource {
+            let targetOffset = min(fileOffset + count, initialFileState.sizeBytes)
+            do {
+                try Task.checkCancellation()
+                try file.seek(toOffset: UInt64(targetOffset))
+                physicalOffset = targetOffset
+                let skipped = targetOffset - fileOffset
+                fileOffset = targetOffset
+                return skipped
+            } catch {
+                callbackError = error
+                return 0
+            }
         }
 
         var remaining = count
@@ -326,7 +462,9 @@ final class StreamingImageReader {
         physicalOffset += Int64(data.count)
         guard !data.isEmpty else { return nil }
 
-        try appendToHash(data, startingAt: fileOffset)
+        if hashesSource {
+            try appendToHash(data, startingAt: fileOffset)
+        }
         if fileOffset == Int64(prefixCache.count), prefixCache.count < prefixCacheLimit {
             prefixCache.append(data.prefix(prefixCacheLimit - prefixCache.count))
         }

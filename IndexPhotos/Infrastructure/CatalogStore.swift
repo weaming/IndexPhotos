@@ -200,7 +200,111 @@ actor CatalogStore {
         guard record.sourceFingerprint == sourceFingerprint else {
             return nil
         }
+        guard record.quickFingerprint != nil else {
+            return nil
+        }
         return record
+    }
+
+    func quickFingerprintCandidates(
+        sizeBytes: Int64,
+        quickFingerprint: String,
+        excluding assetID: String
+    ) throws -> [ContentHashCandidate] {
+        let statement = try prepare(
+            """
+            SELECT a.id, a.path, a.source_fingerprint, a.size_bytes, a.content_hash, f.value
+            FROM assets AS a
+            JOIN asset_features AS f ON f.asset_id = a.id
+            WHERE a.state = 'active' AND a.size_bytes = ? AND a.id != ?
+              AND f.feature_kind = 'fast_features'
+              AND f.algorithm_version = 'fast-v1';
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        try bind(sizeBytes, at: 1, to: statement)
+        try bind(assetID, at: 2, to: statement)
+
+        var candidates: [ContentHashCandidate] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { break }
+            guard result == SQLITE_ROW else {
+                throw IndexPhotosError.database("读取快速指纹候选失败")
+            }
+            guard let candidateID = columnText(statement, index: 0),
+                  let path = columnText(statement, index: 1),
+                  let sourceFingerprint = columnText(statement, index: 2),
+                  let value = columnData(statement, index: 5),
+                  let record = try? JSONDecoder().decode(FastFeatureRecord.self, from: value),
+                  record.quickFingerprint == quickFingerprint
+            else {
+                continue
+            }
+            candidates.append(ContentHashCandidate(
+                assetID: candidateID,
+                path: path,
+                sourceFingerprint: sourceFingerprint,
+                contentHash: columnText(statement, index: 4),
+                fileSize: sqlite3_column_int64(statement, 3)
+            ))
+        }
+        return candidates
+    }
+
+    func completeContentHash(
+        assetID: String,
+        sourceFingerprint: String,
+        contentHash: String
+    ) throws {
+        let statement = try prepare(
+            """
+            SELECT value
+            FROM asset_features
+            WHERE asset_id = ? AND feature_kind = 'fast_features'
+              AND algorithm_version = 'fast-v1'
+            LIMIT 1;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(assetID, at: 1, to: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              let value = columnData(statement, index: 0),
+              var record = try? JSONDecoder().decode(FastFeatureRecord.self, from: value),
+              record.sourceFingerprint == sourceFingerprint
+        else {
+            throw IndexPhotosError.invalidState("无法更新快速特征的完整哈希：\(assetID)")
+        }
+
+        record = FastFeatureRecord(
+            sourceFingerprint: record.sourceFingerprint,
+            contentHash: contentHash,
+            quickFingerprint: record.quickFingerprint,
+            perceptualHash: record.perceptualHash,
+            thumbnailRelativePath: record.thumbnailRelativePath,
+            width: record.width,
+            height: record.height
+        )
+        let encodedRecord = try JSONEncoder().encode(record)
+
+        try execute("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            try updateAssetContentHash(
+                assetID: assetID,
+                sourceFingerprint: sourceFingerprint,
+                contentHash: contentHash
+            )
+            try upsertFeature(
+                assetID: assetID,
+                algorithmVersion: "fast-v1",
+                value: encodedRecord
+            )
+            try execute("COMMIT;")
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
     }
 
     func committedFastFeatures() throws -> [IndexedFastFeature] {
@@ -311,6 +415,7 @@ actor CatalogStore {
         let record = FastFeatureRecord(
             sourceFingerprint: item.sourceFingerprint,
             contentHash: feature.contentHash,
+            quickFingerprint: feature.quickFingerprint,
             perceptualHash: feature.perceptualHash,
             thumbnailRelativePath: thumbnail.relativePath,
             width: feature.width,
@@ -325,7 +430,13 @@ actor CatalogStore {
                 assetID: item.assetID,
                 algorithmVersion: algorithmVersion
             )
-            try updateAssetContentHash(item: item, contentHash: feature.contentHash)
+            if let contentHash = feature.contentHash {
+                try updateAssetContentHash(
+                    assetID: item.assetID,
+                    sourceFingerprint: item.sourceFingerprint,
+                    contentHash: contentHash
+                )
+            }
             try upsertFeature(
                 assetID: item.assetID,
                 algorithmVersion: algorithmVersion,
@@ -910,7 +1021,8 @@ actor CatalogStore {
     }
 
     private func updateAssetContentHash(
-        item: DiscoveredPhoto,
+        assetID: String,
+        sourceFingerprint: String,
         contentHash: String
     ) throws {
         let statement = try prepare(
@@ -923,9 +1035,9 @@ actor CatalogStore {
         defer { sqlite3_finalize(statement) }
 
         try bind(contentHash, at: 1, to: statement)
-        try bind(item.sourceFingerprint, at: 2, to: statement)
+        try bind(sourceFingerprint, at: 2, to: statement)
         try bind(timestamp(.now), at: 3, to: statement)
-        try bind(item.assetID, at: 4, to: statement)
+        try bind(assetID, at: 4, to: statement)
         try step(statement)
     }
 

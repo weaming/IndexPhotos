@@ -3,6 +3,84 @@ import Foundation
 import XCTest
 
 final class CatalogStoreTests: XCTestCase {
+    func testQuickFingerprintCandidateCanBePromotedToFullHash() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("IndexPhotosQuickFingerprintTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try FileManager.default.removeItem(at: directory) }
+
+        let catalog = try CatalogStore(
+            databaseURL: directory.appendingPathComponent("catalog.sqlite")
+        )
+        let rootID = UUID()
+        try await catalog.upsertRoot(
+            id: rootID,
+            displayName: "test",
+            url: directory,
+            bookmarkData: nil
+        )
+        let sessionID = try await catalog.createScanSession(rootID: rootID)
+        try await catalog.markSessionRunning(sessionID, phase: .fastFeatures)
+
+        let items = [
+            DiscoveredPhoto(
+                assetID: "asset-a",
+                rootID: rootID,
+                path: directory.appendingPathComponent("a.jpg").path,
+                fileResourceID: nil,
+                sourceFingerprint: "fingerprint-a",
+                sizeBytes: 5 * 1024 * 1024,
+                modifiedAt: nil
+            ),
+            DiscoveredPhoto(
+                assetID: "asset-b",
+                rootID: rootID,
+                path: directory.appendingPathComponent("b.jpg").path,
+                fileResourceID: nil,
+                sourceFingerprint: "fingerprint-b",
+                sizeBytes: 5 * 1024 * 1024,
+                modifiedAt: nil
+            ),
+        ]
+
+        for item in items {
+            _ = try await catalog.registerDiscovered(item, sessionID: sessionID)
+            _ = try await catalog.commitFastFeature(
+                sessionID: sessionID,
+                item: item,
+                feature: FastFeatureResult(
+                    contentHash: nil,
+                    perceptualHash: 1,
+                    thumbnailData: Data([1]),
+                    width: 1,
+                    height: 1,
+                    quickFingerprint: "quick"
+                ),
+                thumbnail: ThumbnailObject(
+                    key: item.assetID,
+                    relativePath: "thumbnails/small/\(item.assetID).jpg"
+                )
+            )
+        }
+
+        let candidates = try await catalog.quickFingerprintCandidates(
+            sizeBytes: 5 * 1024 * 1024,
+            quickFingerprint: "quick",
+            excluding: "asset-b"
+        )
+        XCTAssertEqual(candidates.map(\.assetID), ["asset-a"])
+
+        try await catalog.completeContentHash(
+            assetID: "asset-a",
+            sourceFingerprint: "fingerprint-a",
+            contentHash: "hash-a"
+        )
+        let committedFeatures = try await catalog.committedFastFeatures()
+        XCTAssertEqual(committedFeatures.map(\.assetID), ["asset-a"])
+
+        try await catalog.close()
+    }
+
     func testIncrementalCountersSurviveRetrySourceChangeAndReopen() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("IndexPhotosCounterTests-\(UUID().uuidString)", isDirectory: true)

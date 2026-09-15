@@ -43,8 +43,10 @@ struct ScanBenchmark {
                 let now = clock.now
                 if lastReportAt.duration(to: now) >= .seconds(1) || progress.status != .running {
                     let elapsed = startedAt.duration(to: now)
+                    let sourceBytesRead = await run.metrics.snapshot()
                     let stats = transferStats(
                         processedBytes: progress.processedBytes,
+                        sourceBytesRead: sourceBytesRead,
                         elapsed: elapsed
                     )
                     print(
@@ -56,7 +58,12 @@ struct ScanBenchmark {
             deadline.cancel()
             let summary = try await catalog.resultSummary()
             let elapsed = startedAt.duration(to: clock.now)
-            let stats = transferStats(processedBytes: finalProgress.processedBytes, elapsed: elapsed)
+            let sourceBytesRead = await run.metrics.snapshot()
+            let stats = transferStats(
+                processedBytes: finalProgress.processedBytes,
+                sourceBytesRead: sourceBytesRead,
+                elapsed: elapsed
+            )
             print(
                 "BENCH result status=\(finalProgress.status.rawValue) files=\(finalProgress.committedCount) failed=\(finalProgress.failedCount) groups=\(summary.duplicateGroupCount) candidates=\(summary.similarityCandidateCount) \(stats) elapsed=\(elapsed)"
             )
@@ -73,17 +80,27 @@ struct ScanBenchmark {
         }
     }
 
-    private static func transferStats(processedBytes: Int64, elapsed: Duration) -> String {
+    private static func transferStats(
+        processedBytes: Int64,
+        sourceBytesRead: Int64,
+        elapsed: Duration
+    ) -> String {
         let processedMB = Double(processedBytes) / 1_000_000
+        let sourceReadMB = Double(sourceBytesRead) / 1_000_000
         let components = elapsed.components
         let elapsedSeconds = Double(components.seconds) + Double(components.attoseconds) / 1e18
         let avgMBps = elapsedSeconds > 0 ? processedMB / elapsedSeconds : 0
+        let sourceReadAvgMBps = elapsedSeconds > 0 ? sourceReadMB / elapsedSeconds : 0
+        let readRatio = processedMB > 0 ? sourceReadMB / processedMB * 100 : 0
 
         return String(
-            format: "bytes=%.2fMB avg=%.2fMB/s",
+            format: "bytes=%.2fMB avg=%.2fMB/s read=%.2fMB readAvg=%.2fMB/s readRatio=%.1f%%",
             locale: Locale(identifier: "en_US_POSIX"),
             processedMB,
-            avgMBps
+            avgMBps,
+            sourceReadMB,
+            sourceReadAvgMBps,
+            readRatio
         )
     }
 }

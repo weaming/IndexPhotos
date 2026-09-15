@@ -43,7 +43,22 @@
       "failed_files": 0,
       "duplicate_groups": 0,
       "similarity_candidates": 0
+    },
+    "optimized_deferred_hash": {
+      "root": "/Volumes/ApplePhotos/苹果相册/来自我的Mac",
+      "status": "completed",
+      "timeout_seconds": 30,
+      "files": 841,
+      "processed_bytes_mb": 470.31,
+      "source_bytes_read_mb": 470.31,
+      "read_ratio_percent": 100.0,
+      "elapsed_seconds": 20.15599825,
+      "read_avg_mb_per_second": 23.33,
+      "failed_files": 0,
+      "duplicate_groups": 0,
+      "similarity_candidates": 31,
+      "cache_condition": "OS file cache was not flushed; application cache was isolated and initially empty"
     }
   },
-  "verification": { "swift_tests_passed": 21, "rust_tests_passed": 4, "clippy": "passed with -D warnings" }
+  "verification": { "swift_tests_passed": 25, "rust_tests_passed": 4, "clippy": "passed with -D warnings" }
 }
