@@ -147,7 +147,7 @@ struct SimilarityCandidateRecord: Sendable {
 }
 
 enum SimilarityReviewPolicy {
-    static let MIN_SCORE = 0.6
+    static let MIN_SCORE = 0.7
 }
 
 enum PhotoDeletionMode: String, Identifiable, Sendable {
