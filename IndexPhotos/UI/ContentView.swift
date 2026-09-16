@@ -27,12 +27,56 @@ struct ContentView: View {
     }
 }
 
+private struct AppLogoView: View {
+    let size: CGFloat
+
+    init(size: CGFloat = 42) {
+        self.size = size
+    }
+
+    var body: some View {
+        Group {
+            if let logoImage = NSApp.applicationIconImage {
+                Image(nsImage: logoImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                Image(systemName: "photo.on.rectangle.angled")
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(.tint)
+                    .padding(size * 0.16)
+            }
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
 private struct SidebarView: View {
     @Environment(AppModel.self) private var model
     @Binding var isImporterPresented: Bool
 
     var body: some View {
         List {
+            Section {
+                HStack(spacing: 12) {
+                    AppLogoView()
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("IndexPhotos")
+                            .font(.headline)
+                        Text("重复照片助手")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 4)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("IndexPhotos，重复照片助手")
+            }
+
             Section("扫描目录") {
                 if let selectedRootURL = model.selectedRootURL {
                     Label {

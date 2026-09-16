@@ -18,6 +18,7 @@
 		392FC3A1E8C7A94B9F611CE5 /* ResultIndexBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D470F93126486C3E0A2804A9 /* ResultIndexBuilderTests.swift */; };
 		3D4FCB5AE473B69F6AB26178 /* CacheMaintenance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14E2624B1E2DF58FB31CADE6 /* CacheMaintenance.swift */; };
 		455ABBB0A2CA48F64DF47FF6 /* EmbeddingIndexBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 282DE4359BB1C0A13132E961 /* EmbeddingIndexBuilderTests.swift */; };
+		4C7674F573AEB4379E845AD2 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = E524A3E513C9C2735EC67C2C /* Assets.xcassets */; };
 		547A27392DDA2851EEC1D584 /* ResultIndexBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2198F68AEF8C1AADA4615BDE /* ResultIndexBuilder.swift */; };
 		6ED3A89AF43DF2092393ACA5 /* VectorGenerationStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 517491E665F08468C6C3E0F7 /* VectorGenerationStore.swift */; };
 		7917558C0B231B981AD9B0C3 /* CacheRoot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 949EF6160860EB72E6F966BD /* CacheRoot.swift */; };
@@ -26,6 +27,7 @@
 		A8ACA6EBEC353F8FB4B4A02E /* FastFeatureExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B80C4070879F4B5234781A9 /* FastFeatureExtractor.swift */; };
 		AA7DE71B5A5252454383ECDE /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 987E283BDE1BC72A799771A9 /* ContentView.swift */; };
 		B6C0B97CF800B52886CDC500 /* ScanModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43827B2C3628EC8509E460BB /* ScanModels.swift */; };
+		C0F822C744D55084A4C0477C /* index-photos-logo.svg in Resources */ = {isa = PBXBuildFile; fileRef = 79D091D0999806C29D31AC92 /* index-photos-logo.svg */; };
 		CAB35FB584C9641B36CC2689 /* ResultIndexer.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC92EE6B6D3E3D74F0F9856B /* ResultIndexer.swift */; };
 		DBC32F3160FF28F1094D637A /* FastFeatureExtractorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0264F9E20E3EE3D3121B0168 /* FastFeatureExtractorTests.swift */; };
 		E6F4CC999A80861590B8C546 /* ThumbnailStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 348AE8CB583DA6D3FBA26620 /* ThumbnailStore.swift */; };
@@ -63,6 +65,7 @@
 		6BDBB8CC7CAA733D311488DF /* EmbeddingIndexBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmbeddingIndexBuilder.swift; sourceTree = "<group>"; };
 		712DEB93285DD8F76279D5BD /* IndexPhotosTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = IndexPhotosTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		74DD0BA6A6920707E20B9333 /* CacheLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheLock.swift; sourceTree = "<group>"; };
+		79D091D0999806C29D31AC92 /* index-photos-logo.svg */ = {isa = PBXFileReference; path = "index-photos-logo.svg"; sourceTree = "<group>"; };
 		8AA737A8E2A94A1B4558E37E /* ImageEmbedding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageEmbedding.swift; sourceTree = "<group>"; };
 		949EF6160860EB72E6F966BD /* CacheRoot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheRoot.swift; sourceTree = "<group>"; };
 		987E283BDE1BC72A799771A9 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -72,6 +75,7 @@
 		D470F93126486C3E0A2804A9 /* ResultIndexBuilderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultIndexBuilderTests.swift; sourceTree = "<group>"; };
 		D790CDEFC434CBBEDBFD4EAF /* GeometryVerifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeometryVerifier.swift; sourceTree = "<group>"; };
 		DC92EE6B6D3E3D74F0F9856B /* ResultIndexer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultIndexer.swift; sourceTree = "<group>"; };
+		E524A3E513C9C2735EC67C2C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		EC12F8B1FDEB30F36A91C875 /* GeometryVerifierTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeometryVerifierTests.swift; sourceTree = "<group>"; };
 		F92F9F5E2DC9056AEBA0C023 /* CatalogStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CatalogStore.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -111,9 +115,11 @@
 		6EBCDB5D28226B0EF2679D44 /* IndexPhotos */ = {
 			isa = PBXGroup;
 			children = (
+				E524A3E513C9C2735EC67C2C /* Assets.xcassets */,
 				A7A479A07D85455616AAC1A9 /* App */,
 				54B3D5552767B29B1B35F521 /* Domain */,
 				8740CD4530797284259439B9 /* Infrastructure */,
+				CBE1A8E5DAA99EFDBE19FE71 /* Resources */,
 				59EE88B056B0A8E768C95F96 /* Scanning */,
 				0F7497EC400E7B35904BA357 /* UI */,
 			);
@@ -174,6 +180,14 @@
 			path = Tests;
 			sourceTree = "<group>";
 		};
+		CBE1A8E5DAA99EFDBE19FE71 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				79D091D0999806C29D31AC92 /* index-photos-logo.svg */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
 		E7AC003C34B5493DE94CC7EC /* Products */ = {
 			isa = PBXGroup;
 			children = (
@@ -210,6 +224,7 @@
 			buildPhases = (
 				6329F50DFAD66078BE8D3D81 /* Build Rust Core */,
 				E1D935C553C07B59CF2223B3 /* Sources */,
+				A310C1CEDF5673140D66F4DF /* Resources */,
 			);
 			buildRules = (
 			);
@@ -252,6 +267,18 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A310C1CEDF5673140D66F4DF /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4C7674F573AEB4379E845AD2 /* Assets.xcassets in Resources */,
+				C0F822C744D55084A4C0477C /* index-photos-logo.svg in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
 		6329F50DFAD66078BE8D3D81 /* Build Rust Core */ = {
@@ -400,6 +427,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = IndexPhotos;
+				INFOPLIST_KEY_CFBundleIconFile = AppIcon.icns;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.photography";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -460,6 +488,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = IndexPhotos;
+				INFOPLIST_KEY_CFBundleIconFile = AppIcon.icns;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.photography";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

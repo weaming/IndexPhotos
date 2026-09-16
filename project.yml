@@ -19,15 +19,19 @@ targets:
     platform: macOS
     sources:
       - path: IndexPhotos
+    resources:
+      - path: IndexPhotos/Assets.xcassets
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.indexphotos.app
         PRODUCT_NAME: IndexPhotos
         INFOPLIST_KEY_CFBundleDisplayName: IndexPhotos
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.photography
+        INFOPLIST_KEY_CFBundleIconFile: AppIcon.icns
         GENERATE_INFOPLIST_FILE: YES
         CURRENT_PROJECT_VERSION: 1
         MARKETING_VERSION: 0.1.0
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/rust-core/include/index_photos_rust.h"
         LIBRARY_SEARCH_PATHS:
           - "$(SRCROOT)/rust-core/target/release"

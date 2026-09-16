@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title description">
+  <title id="title">IndexPhotos</title>
+  <desc id="description">两张叠放的照片与搜索镜，表示查找重复和相似照片。</desc>
+
+  <defs>
+    <linearGradient id="background" x1="64" y1="36" x2="454" y2="478" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#302B78" />
+      <stop offset="0.52" stop-color="#185A8D" />
+      <stop offset="1" stop-color="#087F78" />
+    </linearGradient>
+    <linearGradient id="rear-sky" x1="92" y1="112" x2="344" y2="402" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B5D7FF" />
+      <stop offset="1" stop-color="#6DBBC7" />
+    </linearGradient>
+    <linearGradient id="front-sky" x1="138" y1="88" x2="414" y2="397" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#14285B" />
+      <stop offset="0.62" stop-color="#286B9C" />
+      <stop offset="1" stop-color="#36A49B" />
+    </linearGradient>
+    <linearGradient id="match" x1="276" y1="275" x2="373" y2="372" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFD166" />
+      <stop offset="1" stop-color="#FF6B7A" />
+    </linearGradient>
+    <filter id="card-shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#071027" flood-opacity="0.32" />
+    </filter>
+    <filter id="soft-glow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="12" />
+    </filter>
+    <clipPath id="rear-photo-clip">
+      <rect x="112" y="130" width="216" height="256" rx="36" />
+    </clipPath>
+    <clipPath id="front-photo-clip">
+      <rect x="148" y="108" width="204" height="262" rx="28" />
+    </clipPath>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="#0B1024" />
+  <rect x="16" y="16" width="480" height="480" rx="100" fill="url(#background)" />
+
+  <path d="M24 328C111 280 153 310 222 342C300 378 380 382 488 326V496H24V328Z" fill="#061D3B" opacity="0.16" />
+  <path d="M24 102C113 58 176 74 238 102C327 142 395 137 488 82" fill="none" stroke="#D8F8FF" stroke-width="2" opacity="0.16" />
+  <circle cx="114" cy="104" r="38" fill="#9EE7DE" opacity="0.18" filter="url(#soft-glow)" />
+
+  <g filter="url(#card-shadow)">
+    <g transform="rotate(-10 220 256)">
+      <rect x="88" y="106" width="252" height="310" rx="52" fill="#F5F8FF" />
+      <rect x="112" y="130" width="216" height="256" rx="36" fill="url(#rear-sky)" />
+      <g clip-path="url(#rear-photo-clip)">
+        <circle cx="275" cy="182" r="28" fill="#FFF0B0" opacity="0.86" />
+        <path d="M82 331L169 236L220 289L262 244L358 343V410H82V331Z" fill="#356D88" opacity="0.86" />
+        <path d="M91 363L185 271L234 320L276 284L352 359V410H91V363Z" fill="#164F70" opacity="0.9" />
+        <path d="M112 130H328V168C261 189 190 188 112 163V130Z" fill="#FFFFFF" opacity="0.15" />
+      </g>
+      <rect x="112" y="130" width="216" height="256" rx="36" fill="none" stroke="#FFFFFF" stroke-width="4" opacity="0.52" />
+      <circle cx="137" cy="364" r="8" fill="#FFFFFF" opacity="0.7" />
+      <rect x="155" y="358" width="58" height="12" rx="6" fill="#FFFFFF" opacity="0.46" />
+    </g>
+
+    <g transform="rotate(9 286 236)">
+      <rect x="124" y="84" width="252" height="310" rx="52" fill="#FFFFFF" />
+      <rect x="148" y="108" width="204" height="262" rx="28" fill="url(#front-sky)" />
+      <g clip-path="url(#front-photo-clip)">
+        <circle cx="286" cy="171" r="35" fill="#FFD166" opacity="0.96" />
+        <circle cx="286" cy="171" r="56" fill="#FFD166" opacity="0.17" filter="url(#soft-glow)" />
+        <path d="M120 318L207 218L260 277L301 232L393 335V394H120V318Z" fill="#173E6B" opacity="0.9" />
+        <path d="M124 354L219 268L267 315L312 274L389 349V394H124V354Z" fill="#102D59" />
+        <path d="M148 108H352V147C294 164 218 161 148 138V108Z" fill="#FFFFFF" opacity="0.08" />
+      </g>
+      <rect x="148" y="108" width="204" height="262" rx="28" fill="none" stroke="#FFFFFF" stroke-width="4" opacity="0.7" />
+      <circle cx="173" cy="346" r="8" fill="#FFFFFF" opacity="0.82" />
+      <rect x="191" y="340" width="62" height="12" rx="6" fill="#FFFFFF" opacity="0.56" />
+    </g>
+  </g>
+
+  <g>
+    <path d="M362 372L418 428" fill="none" stroke="#08142F" stroke-width="26" stroke-linecap="round" opacity="0.3" />
+    <path d="M358 368L416 426" fill="none" stroke="#F8FCFF" stroke-width="18" stroke-linecap="round" />
+    <circle cx="306" cy="316" r="76" fill="#071A3B" fill-opacity="0.82" stroke="#F8FCFF" stroke-width="16" />
+    <circle cx="306" cy="316" r="55" fill="url(#match)" opacity="0.98" />
+  </g>
+
+  <path d="M102 78L108 92L122 98L108 104L102 118L96 104L82 98L96 92L102 78Z" fill="#FFFFFF" opacity="0.92" />
+  <path d="M414 94L418 103L427 107L418 111L414 120L410 111L401 107L410 103L414 94Z" fill="#FFE29A" opacity="0.9" />
+</svg>
