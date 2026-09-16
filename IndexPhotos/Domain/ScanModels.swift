@@ -74,6 +74,14 @@ struct ResumableScan: Identifiable, Sendable {
     let updatedAt: Date
 }
 
+struct SavedRoot: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let displayName: String
+    let url: URL
+    let bookmarkData: Data?
+    let updatedAt: Date
+}
+
 struct FastFeatureRecord: Codable, Sendable {
     let sourceFingerprint: String
     let contentHash: String?
@@ -136,6 +144,71 @@ struct SimilarityCandidateRecord: Sendable {
     let score: Double
     let evidenceJSON: String
     let algorithmVersion: String
+}
+
+enum SimilarityReviewPolicy {
+    static let MIN_SCORE = 0.6
+}
+
+enum PhotoDeletionMode: String, Identifiable, Sendable {
+    case trash
+    case permanent
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .trash:
+            return "移到废纸篓"
+        case .permanent:
+            return "永久删除"
+        }
+    }
+}
+
+struct PhotoDeletionTarget: Sendable, Equatable {
+    let assetID: String
+    let path: String
+    let sourceFingerprint: String
+}
+
+struct PhotoDeletionReport: Sendable, Equatable {
+    let deletedCount: Int
+    let failedPaths: [String]
+}
+
+enum SimilarityAlgorithmFilter: String, CaseIterable, Identifiable, Sendable {
+    case all
+    case phash
+    case vision
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .all:
+            return "全部来源"
+        case .phash:
+            return "phash"
+        case .vision:
+            return "vision"
+        }
+    }
+
+    var algorithmVersion: String? {
+        switch self {
+        case .all:
+            return nil
+        case .phash:
+            return "fast-phash-v1"
+        case .vision:
+            return "vision-hnsw-v1"
+        }
+    }
 }
 
 enum ReviewDecision: String, Codable, Sendable {
@@ -223,6 +296,7 @@ struct DiscoveredPhoto: Sendable {
 
 struct ScanRun: Sendable {
     let id: UUID
+    let rootID: UUID
     let updates: AsyncStream<ScanProgressSnapshot>
     let metrics: ScanMetrics
 }
@@ -244,6 +318,7 @@ enum IndexPhotosError: LocalizedError {
     case cacheInitializationFailed(Error)
     case anotherInstanceIsRunning
     case scanAlreadyRunning
+    case scanAlreadyRunningOnVolume(URL)
     case noScanAvailable
     case sourceUnavailable(URL)
     case database(String)
@@ -259,6 +334,8 @@ enum IndexPhotosError: LocalizedError {
             return "IndexPhotos 已在运行，请先关闭其他实例。"
         case .scanAlreadyRunning:
             return "已有扫描任务正在运行。"
+        case let .scanAlreadyRunningOnVolume(url):
+            return "同一磁盘已有目录正在扫描，请先等待当前任务完成：\(url.lastPathComponent)"
         case .noScanAvailable:
             return "没有可恢复的扫描任务。"
         case let .sourceUnavailable(url):

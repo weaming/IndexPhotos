@@ -85,7 +85,7 @@ actor CatalogStore {
             ON CONFLICT(id) DO UPDATE SET
                 display_name = excluded.display_name,
                 path = excluded.path,
-                bookmark_data = excluded.bookmark_data,
+                bookmark_data = COALESCE(excluded.bookmark_data, roots.bookmark_data),
                 updated_at = excluded.updated_at;
             """
         )
@@ -98,6 +98,44 @@ actor CatalogStore {
         try bind(timestamp(.now), at: 5, to: statement)
         try bind(timestamp(.now), at: 6, to: statement)
         try step(statement)
+    }
+
+    func savedRoots() throws -> [SavedRoot] {
+        let statement = try prepare(
+            """
+            SELECT id, display_name, path, bookmark_data, updated_at
+            FROM roots
+            ORDER BY updated_at DESC, id ASC;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        var roots: [SavedRoot] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW else {
+                throw IndexPhotosError.database("读取已保存目录失败")
+            }
+            guard let id = UUID(uuidString: columnText(statement, index: 0) ?? ""),
+                  let displayName = columnText(statement, index: 1),
+                  let path = columnText(statement, index: 2)
+            else {
+                continue
+            }
+            roots.append(
+                SavedRoot(
+                    id: id,
+                    displayName: displayName,
+                    url: URL(fileURLWithPath: path, isDirectory: true),
+                    bookmarkData: columnData(statement, index: 3),
+                    updatedAt: parseTimestamp(columnText(statement, index: 4))
+                )
+            )
+        }
+        return roots
     }
 
     func createScanSession(rootID: UUID) throws -> UUID {
@@ -350,7 +388,7 @@ actor CatalogStore {
         return features
     }
 
-    func embeddingInputs() throws -> [EmbeddingInput] {
+    func embeddingInputs(rootID: UUID? = nil) throws -> [EmbeddingInput] {
         let statement = try prepare(
             """
             SELECT a.id, a.source_fingerprint, f.value
@@ -358,10 +396,15 @@ actor CatalogStore {
             JOIN asset_features AS f ON f.asset_id = a.id
             WHERE a.state = 'active'
               AND f.feature_kind = 'fast_features'
-              AND f.algorithm_version = 'fast-v1';
+              AND f.algorithm_version = 'fast-v1'
+              AND (? IS NULL OR a.root_id = ?);
             """
         )
         defer { sqlite3_finalize(statement) }
+
+        let rootValue = rootID?.uuidString
+        try bind(rootValue, at: 1, to: statement)
+        try bind(rootValue, at: 2, to: statement)
 
         var inputs: [EmbeddingInput] = []
         while true {
@@ -562,6 +605,73 @@ actor CatalogStore {
         }
     }
 
+    func removeMissingAssets(rootID: UUID) throws -> Int {
+        let assetIDs = try assetIDs(forRootID: rootID, state: "missing")
+        guard !assetIDs.isEmpty else {
+            return 0
+        }
+
+        try execute("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            try removeAssetRecords(assetIDs)
+            try execute("COMMIT;")
+            return assetIDs.count
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
+    func removeRoot(_ rootID: UUID) throws -> Int {
+        let assetIDs = try assetIDs(forRootID: rootID)
+
+        try execute("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            try removeAssetRecords(assetIDs)
+
+            let sessionStatement = try prepare(
+                "DELETE FROM scan_sessions WHERE root_id = ?;"
+            )
+            defer { sqlite3_finalize(sessionStatement) }
+            try bind(rootID.uuidString, at: 1, to: sessionStatement)
+            try step(sessionStatement)
+
+            let rootStatement = try prepare(
+                "DELETE FROM roots WHERE id = ?;"
+            )
+            defer { sqlite3_finalize(rootStatement) }
+            try bind(rootID.uuidString, at: 1, to: rootStatement)
+            try step(rootStatement)
+
+            try execute("COMMIT;")
+            return assetIDs.count
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
+    func removeAssets(
+        _ candidateAssetIDs: [String],
+        paths: [String] = []
+    ) throws -> Int {
+        let pathAssetIDs = try assetIDs(forPaths: paths)
+        let uniqueAssetIDs = Array(Set(candidateAssetIDs + pathAssetIDs)).sorted()
+        guard !uniqueAssetIDs.isEmpty else {
+            return 0
+        }
+
+        try execute("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            try removeAssetRecords(uniqueAssetIDs)
+            try execute("COMMIT;")
+            return uniqueAssetIDs.count
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
     func commitFastFeature(
         sessionID: UUID,
         item: DiscoveredPhoto,
@@ -731,7 +841,7 @@ actor CatalogStore {
             try execute(
                 """
                 DELETE FROM similarity_candidates
-                WHERE algorithm_version IN ('fast-phash-v1', 'vision-hnsw-v1')
+                WHERE algorithm_version IN ('exact-v1', 'fast-phash-v1', 'vision-hnsw-v1')
                   AND id NOT IN (
                       SELECT id FROM current_similarity_candidates
                   )
@@ -765,7 +875,7 @@ actor CatalogStore {
                 (SELECT COUNT(*) FROM duplicate_groups
                  WHERE algorithm_version = 'exact-v1'),
                 (SELECT COUNT(*) FROM similarity_candidates
-                 WHERE algorithm_version IN ('fast-phash-v1', 'vision-hnsw-v1'));
+                WHERE algorithm_version IN ('exact-v1', 'fast-phash-v1', 'vision-hnsw-v1'));
             """
         )
         defer { sqlite3_finalize(statement) }
@@ -781,8 +891,25 @@ actor CatalogStore {
 
     func similarityCandidateCounts(
         rootID: UUID? = nil,
-        includeReviewed: Bool = false
+        includeReviewed: Bool = false,
+        reviewedOnly: Bool = false,
+        algorithmFilter: SimilarityAlgorithmFilter = .all
     ) throws -> [Int] {
+        try similarityCandidateCounts(
+            rootIDs: rootID.map { [$0] },
+            includeReviewed: includeReviewed,
+            reviewedOnly: reviewedOnly,
+            algorithmFilter: algorithmFilter
+        )
+    }
+
+    func similarityCandidateCounts(
+        rootIDs: [UUID]?,
+        includeReviewed: Bool = false,
+        reviewedOnly: Bool = false,
+        algorithmFilter: SimilarityAlgorithmFilter = .all
+    ) throws -> [Int] {
+        let rootFilter = makeRootFilter(rootIDs)
         let statement = try prepare(
             """
             SELECT
@@ -802,16 +929,28 @@ actor CatalogStore {
             LEFT JOIN review_decisions AS d ON d.candidate_id = c.id
             WHERE a.state = 'active'
               AND b.state = 'active'
-              AND (? IS NULL OR a.root_id = ?)
-              AND (? = 1 OR d.decision IS NULL);
+              AND \(rootFilter.clause)
+              AND (? = 1 OR (d.decision IS NULL AND c.score > ?))
+              AND (? = 0 OR d.decision IS NOT NULL)
+              AND (? IS NULL OR c.algorithm_version = ?);
             """
         )
         defer { sqlite3_finalize(statement) }
 
-        let rootValue = rootID?.uuidString
-        try bind(rootValue, at: 1, to: statement)
-        try bind(rootValue, at: 2, to: statement)
-        try bind(Int64(includeReviewed ? 1 : 0), at: 3, to: statement)
+        var parameterIndex: Int32 = 1
+        for rootValue in rootFilter.values {
+            try bind(rootValue, at: parameterIndex, to: statement)
+            parameterIndex += 1
+        }
+        try bind(Int64(includeReviewed ? 1 : 0), at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(SimilarityReviewPolicy.MIN_SCORE, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(Int64(reviewedOnly ? 1 : 0), at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
             throw IndexPhotosError.database("读取相似候选分桶统计失败")
@@ -825,10 +964,36 @@ actor CatalogStore {
     func similarityCandidates(
         rootID: UUID? = nil,
         includeReviewed: Bool = false,
+        reviewedOnly: Bool = false,
+        algorithmFilter: SimilarityAlgorithmFilter = .all,
+        includeExact: Bool = true,
         scoreBucket: SimilarityScoreBucket = .all,
         offset: Int = 0,
         limit: Int = 24
     ) throws -> [SimilarityReviewItem] {
+        try similarityCandidates(
+            rootIDs: rootID.map { [$0] },
+            includeReviewed: includeReviewed,
+            reviewedOnly: reviewedOnly,
+            algorithmFilter: algorithmFilter,
+            includeExact: includeExact,
+            scoreBucket: scoreBucket,
+            offset: offset,
+            limit: limit
+        )
+    }
+
+    func similarityCandidates(
+        rootIDs: [UUID]?,
+        includeReviewed: Bool = false,
+        reviewedOnly: Bool = false,
+        algorithmFilter: SimilarityAlgorithmFilter = .all,
+        includeExact: Bool = true,
+        scoreBucket: SimilarityScoreBucket = .all,
+        offset: Int = 0,
+        limit: Int = 24
+    ) throws -> [SimilarityReviewItem] {
+        let rootFilter = makeRootFilter(rootIDs)
         let statement = try prepare(
             """
             SELECT
@@ -851,8 +1016,11 @@ actor CatalogStore {
             LEFT JOIN review_decisions AS d ON d.candidate_id = c.id
             WHERE a.state = 'active'
               AND b.state = 'active'
-              AND (? IS NULL OR a.root_id = ?)
-              AND (? = 1 OR d.decision IS NULL)
+              AND \(rootFilter.clause)
+              AND (? = 1 OR (d.decision IS NULL AND c.score > ?))
+              AND (? = 0 OR d.decision IS NOT NULL)
+              AND (? IS NULL OR c.algorithm_version = ?)
+              AND (? = 1 OR c.algorithm_version != 'exact-v1')
               AND (? IS NULL OR c.score >= ?)
               AND (? IS NULL OR c.score < ?)
             ORDER BY c.score DESC, c.id ASC
@@ -861,16 +1029,34 @@ actor CatalogStore {
         )
         defer { sqlite3_finalize(statement) }
 
-        let rootValue = rootID?.uuidString
-        try bind(rootValue, at: 1, to: statement)
-        try bind(rootValue, at: 2, to: statement)
-        try bind(Int64(includeReviewed ? 1 : 0), at: 3, to: statement)
-        try bind(scoreBucket.lowerBound, at: 4, to: statement)
-        try bind(scoreBucket.lowerBound, at: 5, to: statement)
-        try bind(scoreBucket.upperBound, at: 6, to: statement)
-        try bind(scoreBucket.upperBound, at: 7, to: statement)
-        try bind(Int64(max(limit, 0)), at: 8, to: statement)
-        try bind(Int64(max(offset, 0)), at: 9, to: statement)
+        var parameterIndex: Int32 = 1
+        for rootValue in rootFilter.values {
+            try bind(rootValue, at: parameterIndex, to: statement)
+            parameterIndex += 1
+        }
+        try bind(Int64(includeReviewed ? 1 : 0), at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(SimilarityReviewPolicy.MIN_SCORE, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(Int64(reviewedOnly ? 1 : 0), at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(Int64(includeExact ? 1 : 0), at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(scoreBucket.lowerBound, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(scoreBucket.lowerBound, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(scoreBucket.upperBound, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(scoreBucket.upperBound, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(Int64(max(limit, 0)), at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(Int64(max(offset, 0)), at: parameterIndex, to: statement)
 
         var candidates: [SimilarityReviewItem] = []
         while true {
@@ -933,6 +1119,95 @@ actor CatalogStore {
             )
         }
         return candidates
+    }
+
+    func similarityDeletionTargets(
+        rootIDs: [UUID]?,
+        algorithmFilter: SimilarityAlgorithmFilter = .all,
+        scoreBucket: SimilarityScoreBucket = .all
+    ) throws -> [PhotoDeletionTarget] {
+        let rootFilter = makeRootFilter(rootIDs)
+        let statement = try prepare(
+            """
+            WITH deletion_targets AS (
+                SELECT DISTINCT
+                    CASE WHEN d.decision = 'delete_a' THEN a.id ELSE b.id END AS asset_id
+                FROM similarity_candidates AS c
+                JOIN assets AS a ON a.id = c.asset_a_id
+                JOIN assets AS b ON b.id = c.asset_b_id
+                JOIN review_decisions AS d ON d.candidate_id = c.id
+                WHERE a.state = 'active'
+                  AND b.state = 'active'
+                  AND \(rootFilter.clause)
+                  AND d.decision IN ('delete_a', 'delete_b')
+                  AND c.score > ?
+                  AND (? IS NULL OR c.algorithm_version = ?)
+                  AND (? IS NULL OR c.score >= ?)
+                  AND (? IS NULL OR c.score < ?)
+            )
+            SELECT a.id, a.path, a.source_fingerprint
+            FROM assets AS a
+            JOIN deletion_targets AS t ON t.asset_id = a.id
+            WHERE a.state = 'active'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM similarity_candidates AS keep_candidate
+                  JOIN review_decisions AS keep_decision
+                    ON keep_decision.candidate_id = keep_candidate.id
+                  WHERE keep_decision.decision = 'keep'
+                    AND (
+                        keep_candidate.asset_a_id = a.id
+                        OR keep_candidate.asset_b_id = a.id
+                    )
+              )
+            ORDER BY a.path ASC, a.id ASC;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        var parameterIndex: Int32 = 1
+        for rootValue in rootFilter.values {
+            try bind(rootValue, at: parameterIndex, to: statement)
+            parameterIndex += 1
+        }
+        try bind(SimilarityReviewPolicy.MIN_SCORE, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(scoreBucket.lowerBound, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(scoreBucket.lowerBound, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(scoreBucket.upperBound, at: parameterIndex, to: statement)
+        parameterIndex += 1
+        try bind(scoreBucket.upperBound, at: parameterIndex, to: statement)
+
+        var targets: [PhotoDeletionTarget] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW else {
+                throw IndexPhotosError.database("读取待删除照片失败")
+            }
+            guard let assetID = columnText(statement, index: 0),
+                  let path = columnText(statement, index: 1),
+                  let sourceFingerprint = columnText(statement, index: 2)
+            else {
+                continue
+            }
+            targets.append(
+                PhotoDeletionTarget(
+                    assetID: assetID,
+                    path: path,
+                    sourceFingerprint: sourceFingerprint
+                )
+            )
+        }
+        return targets
     }
 
     func updateSimilarityEvidence(
@@ -1204,7 +1479,61 @@ actor CatalogStore {
         )
     }
 
-    func latestResumableScan() throws -> ResumableScan? {
+    func latestScanProgressesByRoot() throws -> [UUID: ScanProgressSnapshot] {
+        let statement = try prepare(
+            """
+            SELECT s.root_id, s.id, s.status, s.phase, s.discovered_count,
+                   s.committed_count, s.failed_count, s.missing_count,
+                   s.total_bytes, s.processed_bytes, s.is_total_known,
+                   s.last_path_hint, s.last_error, s.updated_at
+            FROM scan_sessions AS s
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM scan_sessions AS newer
+                WHERE newer.root_id = s.root_id
+                  AND (
+                      newer.updated_at > s.updated_at
+                      OR (newer.updated_at = s.updated_at AND newer.id > s.id)
+                  )
+            );
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        var progresses: [UUID: ScanProgressSnapshot] = [:]
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW else {
+                throw IndexPhotosError.database("读取目录扫描状态失败")
+            }
+            guard let rootID = UUID(uuidString: columnText(statement, index: 0) ?? ""),
+                  let sessionID = UUID(uuidString: columnText(statement, index: 1) ?? "")
+            else {
+                continue
+            }
+            progresses[rootID] = try ScanProgressSnapshot(
+                scanID: sessionID,
+                status: decodeStatus(columnText(statement, index: 2)),
+                phase: decodePhase(columnText(statement, index: 3)),
+                discoveredCount: Int(sqlite3_column_int64(statement, 4)),
+                committedCount: Int(sqlite3_column_int64(statement, 5)),
+                failedCount: Int(sqlite3_column_int64(statement, 6)),
+                missingCount: Int(sqlite3_column_int64(statement, 7)),
+                totalBytes: sqlite3_column_int64(statement, 8),
+                processedBytes: sqlite3_column_int64(statement, 9),
+                isTotalKnown: sqlite3_column_int(statement, 10) != 0,
+                lastPath: columnText(statement, index: 11),
+                lastError: columnText(statement, index: 12),
+                updatedAt: parseTimestamp(columnText(statement, index: 13))
+            )
+        }
+        return progresses
+    }
+
+    func resumableScans() throws -> [ResumableScan] {
         let statement = try prepare(
             """
             SELECT s.id, s.root_id, r.path, r.bookmark_data, s.status, s.phase,
@@ -1212,33 +1541,46 @@ actor CatalogStore {
             FROM scan_sessions AS s
             JOIN roots AS r ON r.id = s.root_id
             WHERE s.status IN ('paused', 'recovering')
-            ORDER BY s.updated_at DESC LIMIT 1;
+            ORDER BY s.updated_at DESC, s.id ASC;
             """
         )
         defer { sqlite3_finalize(statement) }
 
-        guard sqlite3_step(statement) == SQLITE_ROW,
-              let id = UUID(uuidString: columnText(statement, index: 0) ?? ""),
-              let rootID = UUID(uuidString: columnText(statement, index: 1) ?? ""),
-              let path = columnText(statement, index: 2),
-              let status = try? decodeStatus(columnText(statement, index: 4)),
-              let phase = try? decodePhase(columnText(statement, index: 5))
-        else {
-            return nil
+        var scans: [ResumableScan] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW else {
+                throw IndexPhotosError.database("读取可继续扫描任务失败")
+            }
+            guard let id = UUID(uuidString: columnText(statement, index: 0) ?? ""),
+                  let rootID = UUID(uuidString: columnText(statement, index: 1) ?? ""),
+                  let path = columnText(statement, index: 2)
+            else {
+                continue
+            }
+            scans.append(
+                ResumableScan(
+                    id: id,
+                    rootID: rootID,
+                    rootURL: URL(fileURLWithPath: path, isDirectory: true),
+                    bookmarkData: columnData(statement, index: 3),
+                    status: try decodeStatus(columnText(statement, index: 4)),
+                    phase: try decodePhase(columnText(statement, index: 5)),
+                    discoveredCount: Int(sqlite3_column_int64(statement, 6)),
+                    committedCount: Int(sqlite3_column_int64(statement, 7)),
+                    failedCount: Int(sqlite3_column_int64(statement, 8)),
+                    updatedAt: parseTimestamp(columnText(statement, index: 9))
+                )
+            )
         }
+        return scans
+    }
 
-        return ResumableScan(
-            id: id,
-            rootID: rootID,
-            rootURL: URL(fileURLWithPath: path, isDirectory: true),
-            bookmarkData: columnData(statement, index: 3),
-            status: status,
-            phase: phase,
-            discoveredCount: Int(sqlite3_column_int64(statement, 6)),
-            committedCount: Int(sqlite3_column_int64(statement, 7)),
-            failedCount: Int(sqlite3_column_int64(statement, 8)),
-            updatedAt: parseTimestamp(columnText(statement, index: 9))
-        )
+    func latestResumableScan() throws -> ResumableScan? {
+        try resumableScans().first
     }
 
     private func updateStatus(_ sessionID: UUID, status: ScanSessionStatus) throws {
@@ -1766,6 +2108,8 @@ actor CatalogStore {
                 ON scan_items(session_id, status);
             CREATE INDEX IF NOT EXISTS idx_assets_root_state
                 ON assets(root_id, state);
+            CREATE INDEX IF NOT EXISTS idx_similarity_candidates_score
+                ON similarity_candidates(score DESC, id ASC);
 
             CREATE TRIGGER IF NOT EXISTS fast_feature_progress_insert
             AFTER INSERT ON scan_items WHEN NEW.phase = 'fast_features'
@@ -1827,6 +2171,224 @@ actor CatalogStore {
             sqlite3_free(errorMessage)
             throw IndexPhotosError.database(message)
         }
+    }
+
+    private func assetIDs(
+        forRootID rootID: UUID,
+        state: String? = nil
+    ) throws -> [String] {
+        let stateFilter = state == nil ? "" : " AND state = ?"
+        let statement = try prepare(
+            "SELECT id FROM assets WHERE root_id = ?\(stateFilter);"
+        )
+        defer { sqlite3_finalize(statement) }
+
+        try bind(rootID.uuidString, at: 1, to: statement)
+        if let state {
+            try bind(state, at: 2, to: statement)
+        }
+
+        var assetIDs: [String] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW else {
+                throw IndexPhotosError.database("读取目录资产失败")
+            }
+            if let assetID = columnText(statement, index: 0) {
+                assetIDs.append(assetID)
+            }
+        }
+        return assetIDs
+    }
+
+    private func assetIDs(forPaths paths: [String]) throws -> [String] {
+        let uniquePaths = Array(Set(paths)).sorted()
+        guard !uniquePaths.isEmpty else {
+            return []
+        }
+
+        let placeholders = makePlaceholders(count: uniquePaths.count)
+        let statement = try prepare(
+            "SELECT id FROM assets WHERE path IN (\(placeholders));"
+        )
+        defer { sqlite3_finalize(statement) }
+        for (index, path) in uniquePaths.enumerated() {
+            try bind(path, at: Int32(index + 1), to: statement)
+        }
+
+        var assetIDs: [String] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW else {
+                throw IndexPhotosError.database("读取待清理路径资产失败")
+            }
+            if let assetID = columnText(statement, index: 0) {
+                assetIDs.append(assetID)
+            }
+        }
+        return assetIDs
+    }
+
+    private func removeAssetRecords(_ assetIDs: [String]) throws {
+        guard !assetIDs.isEmpty else {
+            return
+        }
+
+        let placeholders = makePlaceholders(count: assetIDs.count)
+        let featureStatement = try prepare(
+            """
+            SELECT value
+            FROM asset_features
+            WHERE asset_id IN (\(placeholders))
+              AND feature_kind = 'fast_features';
+            """
+        )
+        var thumbnailPaths: [String] = []
+        do {
+            for (index, assetID) in assetIDs.enumerated() {
+                try bind(assetID, at: Int32(index + 1), to: featureStatement)
+            }
+            while true {
+                let result = sqlite3_step(featureStatement)
+                if result == SQLITE_DONE {
+                    break
+                }
+                guard result == SQLITE_ROW else {
+                    throw IndexPhotosError.database("读取待清理缩略图失败")
+                }
+                guard let value = columnData(featureStatement, index: 0),
+                      let record = try? JSONDecoder().decode(
+                          FastFeatureRecord.self,
+                          from: value
+                      )
+                else {
+                    continue
+                }
+                thumbnailPaths.append(record.thumbnailRelativePath)
+            }
+        } catch {
+            sqlite3_finalize(featureStatement)
+            throw error
+        }
+        sqlite3_finalize(featureStatement)
+
+        for thumbnailPath in thumbnailPaths {
+            try decrementCacheObject(relativePath: thumbnailPath)
+        }
+
+        let candidateStatement = try prepare(
+            """
+            DELETE FROM review_decisions
+            WHERE candidate_id IN (
+                SELECT id FROM similarity_candidates
+                WHERE asset_a_id IN (\(placeholders))
+                   OR asset_b_id IN (\(placeholders))
+            );
+            """
+        )
+        defer { sqlite3_finalize(candidateStatement) }
+        var parameterIndex: Int32 = 1
+        for assetID in assetIDs + assetIDs {
+            try bind(assetID, at: parameterIndex, to: candidateStatement)
+            parameterIndex += 1
+        }
+        try step(candidateStatement)
+
+        let similarityStatement = try prepare(
+            """
+            DELETE FROM similarity_candidates
+            WHERE asset_a_id IN (\(placeholders))
+               OR asset_b_id IN (\(placeholders));
+            """
+        )
+        defer { sqlite3_finalize(similarityStatement) }
+        parameterIndex = 1
+        for assetID in assetIDs + assetIDs {
+            try bind(assetID, at: parameterIndex, to: similarityStatement)
+            parameterIndex += 1
+        }
+        try step(similarityStatement)
+
+        let duplicateMemberStatement = try prepare(
+            "DELETE FROM duplicate_members WHERE asset_id IN (\(placeholders));"
+        )
+        defer { sqlite3_finalize(duplicateMemberStatement) }
+        for (index, assetID) in assetIDs.enumerated() {
+            try bind(assetID, at: Int32(index + 1), to: duplicateMemberStatement)
+        }
+        try step(duplicateMemberStatement)
+
+        let scanItemStatement = try prepare(
+            "DELETE FROM scan_items WHERE asset_id IN (\(placeholders));"
+        )
+        defer { sqlite3_finalize(scanItemStatement) }
+        for (index, assetID) in assetIDs.enumerated() {
+            try bind(assetID, at: Int32(index + 1), to: scanItemStatement)
+        }
+        try step(scanItemStatement)
+
+        let featureDeleteStatement = try prepare(
+            "DELETE FROM asset_features WHERE asset_id IN (\(placeholders));"
+        )
+        defer { sqlite3_finalize(featureDeleteStatement) }
+        for (index, assetID) in assetIDs.enumerated() {
+            try bind(assetID, at: Int32(index + 1), to: featureDeleteStatement)
+        }
+        try step(featureDeleteStatement)
+
+        let assetStatement = try prepare(
+            "DELETE FROM assets WHERE id IN (\(placeholders));"
+        )
+        defer { sqlite3_finalize(assetStatement) }
+        for (index, assetID) in assetIDs.enumerated() {
+            try bind(assetID, at: Int32(index + 1), to: assetStatement)
+        }
+        try step(assetStatement)
+
+        try execute(
+            """
+            DELETE FROM duplicate_groups
+            WHERE algorithm_version = 'exact-v1'
+              AND NOT EXISTS (
+                  SELECT 1 FROM duplicate_members
+                  WHERE duplicate_members.group_id = duplicate_groups.id
+              );
+            """
+        )
+    }
+
+    private func makePlaceholders(count: Int) -> String {
+        Array(repeating: "?", count: count).joined(separator: ", ")
+    }
+
+    private struct RootFilter {
+        let clause: String
+        let values: [String]
+    }
+
+    private func makeRootFilter(_ rootIDs: [UUID]?) -> RootFilter {
+        guard let rootIDs else {
+            return RootFilter(clause: "1", values: [])
+        }
+
+        let uniqueRootIDs = Set(rootIDs).sorted { $0.uuidString < $1.uuidString }
+        guard !uniqueRootIDs.isEmpty else {
+            return RootFilter(clause: "0", values: [])
+        }
+
+        let placeholders = Array(repeating: "?", count: uniqueRootIDs.count)
+            .joined(separator: ", ")
+        let selectedRootsClause = uniqueRootIDs.count > 1
+            ? "(a.root_id IN (\(placeholders)) AND b.root_id IN (\(placeholders)) AND a.root_id != b.root_id)"
+            : "(a.root_id IN (\(placeholders)) OR b.root_id IN (\(placeholders)))"
+        let values = uniqueRootIDs.map(\.uuidString) + uniqueRootIDs.map(\.uuidString)
+        return RootFilter(clause: selectedRootsClause, values: values)
     }
 
     private func prepare(_ sql: String) throws -> OpaquePointer {

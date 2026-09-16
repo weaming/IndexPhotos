@@ -19,6 +19,12 @@ final class ResultIndexBuilderTests: XCTestCase {
         features.append(IndexedFastFeature(assetID: "asset-041", contentHash: "same", perceptualHash: 0))
         let result = try ResultIndexBuilder.build(features: features)
         XCTAssertTrue(result.candidates.contains { $0.assetAID == "asset-040" && $0.assetBID == "asset-041" })
+        XCTAssertEqual(
+            result.candidates.filter {
+                $0.algorithmVersion == ResultIndexBuilder.EXACT_ALGORITHM_VERSION
+            }.count,
+            40
+        )
     }
 
     func testNearestMatchesAgreeWithBruteForce() {
@@ -88,7 +94,12 @@ final class ResultIndexBuilderTests: XCTestCase {
         print("BENCH duplicate_index count=\(features.count) elapsed=\(startedAt.duration(to: clock.now))")
         XCTAssertEqual(result.groups.count, 1)
         XCTAssertEqual(result.groups.first?.assetIDs.count, features.count)
-        XCTAssertTrue(result.candidates.isEmpty)
+        XCTAssertEqual(
+            result.candidates.filter {
+                $0.algorithmVersion == ResultIndexBuilder.EXACT_ALGORITHM_VERSION
+            }.count,
+            features.count - 1
+        )
     }
 
     func testExactDuplicatesAndEditedCandidatesAreSeparated() throws {
@@ -119,12 +130,15 @@ final class ResultIndexBuilderTests: XCTestCase {
 
         XCTAssertEqual(result.groups.count, 1)
         XCTAssertEqual(result.groups.first?.assetIDs, ["asset-a", "asset-b"])
-        XCTAssertEqual(result.candidates.count, 2)
-        XCTAssertTrue(
-            result.candidates.allSatisfy { $0.relationKind == "edited_same_photo" }
+        XCTAssertEqual(result.candidates.count, 3)
+        XCTAssertEqual(
+            result.candidates.filter { $0.relationKind == "exact_same_file" }.count,
+            1
         )
         XCTAssertTrue(
-            result.candidates.allSatisfy {
+            result.candidates.filter {
+                $0.relationKind == "edited_same_photo"
+            }.allSatisfy {
                 [$0.assetAID, $0.assetBID].contains("asset-c")
             }
         )

@@ -15,7 +15,7 @@ struct ContentView: View {
         .fileImporter(
             isPresented: $isImporterPresented,
             allowedContentTypes: [.folder],
-            allowsMultipleSelection: false
+            allowsMultipleSelection: true
         ) { result in
             switch result {
             case let .success(urls):
@@ -57,6 +57,8 @@ private struct AppLogoView: View {
 private struct SidebarView: View {
     @Environment(AppModel.self) private var model
     @Binding var isImporterPresented: Bool
+    @State private var rootToRemove: SavedRoot?
+    @State private var isRootRemovalDialogPresented = false
 
     var body: some View {
         List {
@@ -77,46 +79,61 @@ private struct SidebarView: View {
                 .accessibilityLabel("IndexPhotos，重复照片助手")
             }
 
-            Section("扫描目录") {
-                if let selectedRootURL = model.selectedRootURL {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(selectedRootURL.lastPathComponent)
-                            Text(selectedRootURL.path)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                        }
-                    } icon: {
-                        Image(systemName: "folder")
-                    }
-                } else {
+            Section {
+                HStack {
+                    Text("目录")
+                    Spacer()
+                    Toggle(
+                        "多选目录",
+                        isOn: Binding(
+                            get: { model.isSimilarityMultiSelectEnabled },
+                            set: { model.setSimilarityMultiSelectEnabled($0) }
+                        )
+                    )
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .help("开启后可勾选多个目录进行跨根目录相似探测")
+                }
+
+                if model.savedRoots.isEmpty {
                     Text("尚未选择目录")
                         .foregroundStyle(.secondary)
                 }
 
-                Button("选择照片目录…") {
+                ForEach(model.savedRoots) { root in
+                    SavedRootListItem(root: root) {
+                        rootToRemove = root
+                        isRootRemovalDialogPresented = true
+                    }
+                }
+
+                Button("添加照片目录…") {
                     isImporterPresented = true
                 }
+            } header: {
+                Text("扫描目录")
             }
 
-            if let resumableScan = model.resumableScan {
+            if !model.resumableScans.isEmpty {
                 Section("可继续任务") {
-                    Button {
-                        model.resumeScan()
-                    } label: {
-                        Label {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("继续扫描")
-                                Text("已提交 \(resumableScan.committedCount) / \(resumableScan.discoveredCount)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                    ForEach(model.resumableScans) { resumableScan in
+                        Button {
+                            model.selectRoot(resumableScan.rootID)
+                            model.resumeScan(for: resumableScan.rootID)
+                        } label: {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(model.rootName(for: resumableScan.rootID))
+                                    Text("已提交 \(resumableScan.committedCount) / \(resumableScan.discoveredCount)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } icon: {
+                                Image(systemName: "arrow.clockwise")
                             }
-                        } icon: {
-                            Image(systemName: "arrow.clockwise")
                         }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
             }
 
@@ -136,6 +153,23 @@ private struct SidebarView: View {
             }
         }
         .navigationTitle("IndexPhotos")
+        .confirmationDialog(
+            "移除目录索引？",
+            isPresented: $isRootRemovalDialogPresented,
+            titleVisibility: .visible
+        ) {
+            if let root = rootToRemove {
+                Button("移除 \(root.displayName) 的索引", role: .destructive) {
+                    model.removeSavedRoot(root.id)
+                }
+            }
+        } message: {
+            Text(
+                rootToRemove.map {
+                    "将清除该目录在 IndexPhotos 中的扫描结果和缓存引用，不会删除磁盘上的实际目录或照片。\n\n\($0.url.path)"
+                } ?? "将清除该目录在 IndexPhotos 中的扫描结果和缓存引用。"
+            )
+        }
         .safeAreaInset(edge: .bottom) {
             Text(model.statusMessage)
                 .font(.caption)
@@ -143,6 +177,141 @@ private struct SidebarView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal)
                 .padding(.vertical, 8)
+        }
+    }
+}
+
+private struct SavedRootListItem: View {
+    @Environment(AppModel.self) private var model
+    let root: SavedRoot
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if model.isSimilarityMultiSelectEnabled {
+                Button {
+                    model.toggleSimilarityRoot(root.id)
+                } label: {
+                    Image(
+                        systemName: model.isSimilarityRootSelected(root.id)
+                            ? "checkmark.square.fill"
+                            : "square"
+                    )
+                    .foregroundStyle(
+                        model.isSimilarityRootSelected(root.id)
+                            ? Color.accentColor
+                            : Color.secondary
+                    )
+                    .frame(width: 22, height: 28)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("纳入相似探测")
+            }
+
+            Button {
+                model.selectRoot(root.id)
+            } label: {
+                SavedRootRow(
+                    root: root,
+                    progress: model.progress(for: root.id),
+                    isSelected: model.selectedRootID == root.id,
+                    isScanning: model.activeScanRootIDs.contains(root.id)
+                )
+            }
+            .buttonStyle(.plain)
+
+            SavedRootActionsMenu(
+                isDisabled: model.activeScanRootIDs.contains(root.id),
+                onRemove: onRemove
+            )
+        }
+    }
+}
+
+private struct SavedRootActionsMenu: View {
+    let isDisabled: Bool
+    let onRemove: () -> Void
+
+    var body: some View {
+        Menu {
+            Button("移除目录索引", role: .destructive, action: onRemove)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+                .accessibilityLabel("目录操作")
+        }
+        .menuStyle(.borderlessButton)
+        .disabled(isDisabled)
+        .help(isDisabled ? "扫描中不能移除目录索引" : "目录操作")
+    }
+}
+
+private struct SavedRootRow: View {
+    let root: SavedRoot
+    let progress: ScanProgressSnapshot
+    let isSelected: Bool
+    let isScanning: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: isScanning ? "arrow.triangle.2.circlepath" : "folder")
+                .foregroundStyle(isScanning ? Color.accentColor : Color.secondary)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(root.displayName)
+                    .lineLimit(1)
+                Text(root.url.path)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Text(statusTitle)
+                    .font(.caption2)
+                    .foregroundStyle(isScanning ? Color.accentColor : Color.secondary)
+            }
+
+            Spacer(minLength: 4)
+
+            if isSelected {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.tint)
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+    }
+
+    private var statusTitle: String {
+        if isScanning {
+            return "扫描中 · \(phaseTitle(progress.phase))"
+        }
+        switch progress.status {
+        case .paused, .recovering:
+            return "已暂停，可继续"
+        case .completed:
+            return "已完成 · \(progress.committedCount) 个文件"
+        case .cancelled:
+            return "已取消"
+        case .failed:
+            return "扫描失败"
+        case .queued, .running, .pausing:
+            return phaseTitle(progress.phase)
+        }
+    }
+
+    private func phaseTitle(_ phase: ScanPhase) -> String {
+        switch phase {
+        case .prepare: return "准备"
+        case .enumerate: return "登记"
+        case .fastFeatures: return "快速特征"
+        case .embedding: return "向量"
+        case .index: return "索引"
+        case .verify: return "复核"
+        case .finalize: return "整理"
         }
     }
 }
@@ -167,21 +336,30 @@ private struct DashboardView: View {
                 } label: {
                     Label("开始扫描", systemImage: "play.fill")
                 }
-                .disabled(model.isScanning || model.selectedRootURL == nil)
+                .disabled(model.isSelectedRootScanning || model.selectedRootURL == nil)
+
+                if model.selectedRootResumableScan != nil {
+                    Button {
+                        model.resumeScan()
+                    } label: {
+                        Label("继续扫描", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(model.isSelectedRootScanning)
+                }
 
                 Button {
                     model.pauseScan()
                 } label: {
                     Label("暂停", systemImage: "pause.fill")
                 }
-                .disabled(!model.isScanning)
+                .disabled(!model.isSelectedRootScanning)
 
                 Button {
                     model.cancelScan()
                 } label: {
                     Label("取消", systemImage: "stop.fill")
                 }
-                .disabled(!model.isScanning)
+                .disabled(!model.isSelectedRootScanning)
             }
         }
         .alert("发生错误", isPresented: errorPresented) {
@@ -210,7 +388,7 @@ private struct WelcomeView: View {
         ContentUnavailableView {
             Label("选择照片目录", systemImage: "photo.on.rectangle")
         } description: {
-            Text("选择一个目录后开始登记照片。扫描结果和断点信息会保存到 ~/.index-photos/。")
+            Text("选择一个或多个目录后查找相同或相似的照片。扫描结果和断点信息会保存到 ~/.index-photos/。")
         }
     }
 }
@@ -265,15 +443,17 @@ private struct ScanDashboardView: View {
 
 private struct SimilarityCandidatesPanel: View {
     @Environment(AppModel.self) private var model
+    @State private var isDeletionDialogPresented = false
+    @State private var deletionMode = PhotoDeletionMode.trash
 
     var body: some View {
-        GroupBox("相似候选") {
+        GroupBox("相同或相似候选") {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .center, spacing: 12) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(
                             model.showReviewedSimilarityCandidates
-                                ? "显示全部候选"
+                                ? "已审核候选"
                                 : "待人工处理"
                         )
                         Text("\(model.similarityVisibleCount) 项")
@@ -284,6 +464,7 @@ private struct SimilarityCandidatesPanel: View {
 
                     Spacer()
 
+                    SimilarityAlgorithmMenu()
                     SimilarityScoreBucketMenu()
 
                     Button {
@@ -299,6 +480,40 @@ private struct SimilarityCandidatesPanel: View {
                     .buttonStyle(.bordered)
                 }
 
+                if model.pendingDeletionCount > 0 {
+                    HStack(spacing: 10) {
+                        Label(
+                            "待删除 \(model.pendingDeletionCount) 项",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .foregroundStyle(.red)
+
+                        Spacer(minLength: 0)
+
+                        Button {
+                            deletionMode = .trash
+                            isDeletionDialogPresented = true
+                        } label: {
+                            Label("移到废纸篓", systemImage: "trash")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+
+                        Button {
+                            deletionMode = .permanent
+                            isDeletionDialogPresented = true
+                        } label: {
+                            Label("永久删除", systemImage: "trash.slash")
+                        }
+                        .buttonStyle(.bordered)
+                        .foregroundStyle(.red)
+                    }
+                    .disabled(model.isDeletingPhotos)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                }
+
                 if model.similarityCandidates.isEmpty,
                    model.isLoadingSimilarityCandidates
                 {
@@ -306,12 +521,17 @@ private struct SimilarityCandidatesPanel: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else if model.similarityCandidates.isEmpty {
                     ContentUnavailableView {
-                        Label("暂无相似候选", systemImage: "checkmark.circle")
+                        Label(
+                            model.showReviewedSimilarityCandidates
+                                ? "暂无已审核候选"
+                                : "暂无待处理候选",
+                            systemImage: "checkmark.circle"
+                        )
                     } description: {
                         Text(
                             model.showReviewedSimilarityCandidates
-                                ? "当前目录还没有可查看的相似照片。"
-                                : "新发现的轻微修改、裁剪或曝光变化会出现在这里。"
+                                ? "当前探测范围还没有已审核的相似照片。"
+                                : "相似度超过 0.6 的相同或相似照片会出现在当前探测范围。"
                         )
                     }
                     .frame(maxWidth: .infinity)
@@ -349,6 +569,52 @@ private struct SimilarityCandidatesPanel: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .confirmationDialog(
+            "确认\(deletionMode.title)",
+            isPresented: $isDeletionDialogPresented,
+            titleVisibility: .visible
+        ) {
+            Button(deletionMode.title, role: .destructive) {
+                model.executePendingDeletions(mode: deletionMode)
+            }
+        } message: {
+            switch deletionMode {
+            case .trash:
+                Text("将把当前筛选中的 \(model.pendingDeletionCount) 张照片移到 macOS 废纸篓，并清理对应索引。照片仍可从废纸篓恢复。")
+            case .permanent:
+                Text("将永久删除当前筛选中的 \(model.pendingDeletionCount) 张照片，并清理对应索引。此操作无法恢复。")
+            }
+        }
+    }
+}
+
+private struct SimilarityAlgorithmMenu: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Menu {
+            ForEach(SimilarityAlgorithmFilter.allCases) { filter in
+                Button {
+                    model.selectSimilarityAlgorithmFilter(filter)
+                } label: {
+                    Label {
+                        Text(filter.title)
+                    } icon: {
+                        Image(
+                            systemName: filter == model.similarityAlgorithmFilter
+                                ? "checkmark"
+                                : "circle"
+                        )
+                    }
+                }
+            }
+        } label: {
+            Label(
+                "来源：\(model.similarityAlgorithmFilter.title)",
+                systemImage: "camera.filters"
+            )
+        }
+        .menuStyle(.borderlessButton)
     }
 }
 
@@ -365,7 +631,7 @@ private struct SimilarityScoreBucketMenu: View {
 
             Divider()
 
-            ForEach(SimilarityScoreBucket.valuesDescending) { bucket in
+            ForEach(availableBuckets) { bucket in
                 Button {
                     model.selectSimilarityScoreBucket(bucket)
                 } label: {
@@ -379,6 +645,12 @@ private struct SimilarityScoreBucketMenu: View {
             )
         }
         .menuStyle(.borderlessButton)
+    }
+
+    private var availableBuckets: [SimilarityScoreBucket] {
+        SimilarityScoreBucket.valuesDescending.filter {
+            model.similarityBucketCount(for: $0) > 0
+        }
     }
 
     private func menuTitle(for bucket: SimilarityScoreBucket) -> String {
@@ -396,6 +668,14 @@ private struct SimilarityCandidatesPagination: View {
                 .foregroundStyle(.secondary)
 
             Spacer()
+
+            Button {
+                model.setSimilarityPage(0)
+            } label: {
+                Label("首页", systemImage: "chevron.left.2")
+            }
+            .buttonStyle(.bordered)
+            .disabled(!model.hasPreviousSimilarityPage || model.isLoadingSimilarityCandidates)
 
             Button {
                 model.setSimilarityPage(model.similarityPageIndex - 1)
@@ -416,6 +696,14 @@ private struct SimilarityCandidatesPagination: View {
             }
             .buttonStyle(.bordered)
             .disabled(!model.hasNextSimilarityPage || model.isLoadingSimilarityCandidates)
+
+            Button {
+                model.setSimilarityPage(model.similarityPageCount - 1)
+            } label: {
+                Label("尾页", systemImage: "chevron.right.2")
+            }
+            .buttonStyle(.bordered)
+            .disabled(!model.hasNextSimilarityPage || model.isLoadingSimilarityCandidates)
         }
         .font(.caption)
     }
@@ -433,7 +721,6 @@ private struct SimilarityCandidateRow: View {
             HStack(alignment: .top, spacing: 16) {
                 CandidatePhotoCard(
                     path: candidate.assetAPath,
-                    sizeBytes: candidate.assetASizeBytes,
                     thumbnailRootURL: thumbnailRootURL,
                     thumbnailRelativePath: candidate.thumbnailARelativePath
                 )
@@ -445,26 +732,27 @@ private struct SimilarityCandidateRow: View {
 
                 CandidatePhotoCard(
                     path: candidate.assetBPath,
-                    sizeBytes: candidate.assetBSizeBytes,
                     thumbnailRootURL: thumbnailRootURL,
                     thumbnailRelativePath: candidate.thumbnailBRelativePath
                 )
             }
 
             HStack(spacing: 12) {
-                Text(
-                    "相似度 \(candidate.score, format: .number.precision(.fractionLength(2)))"
-                )
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                Text(metadataText)
+                    .font(.title3.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
 
-                Text(candidate.relationKind)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                Spacer(minLength: 0)
 
-                Spacer()
-
-                if let decision = candidate.decision {
+                if isUpdating {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 22, height: 22)
+                } else if let decision = candidate.decision {
                     Text(reviewDecisionTitle(decision))
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -475,10 +763,10 @@ private struct SimilarityCandidateRow: View {
                     Button("保留两张") {
                         onDecision(.keep)
                     }
-                    Button("删除左图", role: .destructive) {
+                    Button("标记左图待删除", role: .destructive) {
                         onDecision(.deleteA)
                     }
-                    Button("删除右图", role: .destructive) {
+                    Button("标记右图待删除", role: .destructive) {
                         onDecision(.deleteB)
                     }
                     Button("跳过") {
@@ -487,11 +775,6 @@ private struct SimilarityCandidateRow: View {
                 }
             }
             .disabled(isUpdating)
-
-            if isUpdating {
-                ProgressView()
-                    .controlSize(.small)
-            }
         }
         .padding(12)
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
@@ -502,20 +785,44 @@ private struct SimilarityCandidateRow: View {
         case .keep:
             return "已标记保留两张"
         case .deleteA:
-            return "已标记删除左图"
+            return "已标记左图待删除"
         case .deleteB:
-            return "已标记删除右图"
+            return "已标记右图待删除"
         case .process:
             return "已审核"
         case .ignore:
             return "已跳过"
         }
     }
+
+    private var metadataText: String {
+        "\(sizeInMB(candidate.assetASizeBytes))MB / \(sizeInMB(candidate.assetBSizeBytes))MB, \(relationTitle) \(String(format: "%.2f", candidate.score)), \(algorithmTitle)"
+    }
+
+    private var relationTitle: String {
+        candidate.relationKind == "exact_same_file" ? "相同" : "相似"
+    }
+
+    private var algorithmTitle: String {
+        switch candidate.algorithmVersion {
+        case "exact-v1":
+            return "exact"
+        case "fast-phash-v1":
+            return "phash"
+        case "vision-hnsw-v1":
+            return "vision"
+        default:
+            return candidate.algorithmVersion
+        }
+    }
+
+    private func sizeInMB(_ sizeBytes: Int64) -> String {
+        String(format: "%.2f", Double(max(sizeBytes, 0)) / 1_000_000)
+    }
 }
 
 private struct CandidatePhotoCard: View {
     let path: String
-    let sizeBytes: Int64
     let thumbnailRootURL: URL?
     let thumbnailRelativePath: String?
 
@@ -530,10 +837,6 @@ private struct CandidatePhotoCard: View {
                 .font(.headline)
                 .lineLimit(1)
                 .help(path)
-
-            Text("\(sizeInMB, format: .number.precision(.fractionLength(2))) MB")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
 
             Text(path)
                 .font(.caption.monospaced())
@@ -551,9 +854,6 @@ private struct CandidatePhotoCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var sizeInMB: Double {
-        Double(max(sizeBytes, 0)) / 1_000_000
-    }
 }
 
 private struct CachedThumbnailView: View {
@@ -639,7 +939,10 @@ private struct ProgressPanel: View {
     var body: some View {
         GroupBox("扫描进度") {
             VStack(alignment: .leading, spacing: 12) {
-                if let fractionCompleted = snapshot.fractionCompleted {
+                if isNotStarted {
+                    Label("尚未开始", systemImage: "circle")
+                        .foregroundStyle(.secondary)
+                } else if let fractionCompleted = snapshot.fractionCompleted {
                     ProgressView(value: fractionCompleted)
                 } else {
                     ProgressView()
@@ -652,7 +955,7 @@ private struct ProgressPanel: View {
                     ProgressMetric(title: "阶段", value: phaseTitle(snapshot.phase))
                 }
 
-                if !snapshot.isTotalKnown {
+                if !isNotStarted, !snapshot.isTotalKnown {
                     Text("正在枚举目录，文件总量确定后显示精确进度。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -660,6 +963,10 @@ private struct ProgressPanel: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var isNotStarted: Bool {
+        snapshot.scanID == nil && snapshot.status == .completed
     }
 
     private func phaseTitle(_ phase: ScanPhase) -> String {

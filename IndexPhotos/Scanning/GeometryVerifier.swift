@@ -80,18 +80,10 @@ struct GeometryVerifier {
                         left: leftImage,
                         right: rightImage
                     )
-                    geometryEvidence = [
-                        "algorithm": GeometryVerifier.ALGORITHM_VERSION,
-                        "status": "completed",
-                        "assetASourceFingerprint": candidate.assetASourceFingerprint,
-                        "assetBSourceFingerprint": candidate.assetBSourceFingerprint,
-                        "matchedCount": Int(result.matchedCount),
-                        "inlierCount": Int(result.inlierCount),
-                        "inlierRatio": Double(result.inlierRatio),
-                        "coverage": Double(result.coverage),
-                        "medianError": Double(result.medianError),
-                        "passed": result.passed,
-                    ]
+                    geometryEvidence = completedEvidence(
+                        candidate: candidate,
+                        result: result
+                    )
                 } catch {
                     geometryEvidence = unavailableEvidence(
                         assetASourceFingerprint: candidate.assetASourceFingerprint,
@@ -223,6 +215,38 @@ struct GeometryVerifier {
             ]
         }
 
+        private func completedEvidence(
+            candidate: SimilarityReviewItem,
+            result: RustGeometryResult
+        ) -> [String: Any] {
+            let inlierRatio = Double(result.inlierRatio)
+            let coverage = Double(result.coverage)
+            let medianError = Double(result.medianError)
+            guard inlierRatio.isFinite,
+                  coverage.isFinite,
+                  medianError.isFinite
+            else {
+                return unavailableEvidence(
+                    assetASourceFingerprint: candidate.assetASourceFingerprint,
+                    assetBSourceFingerprint: candidate.assetBSourceFingerprint,
+                    error: GeometryVerificationError.nonFiniteResult
+                )
+            }
+
+            return [
+                "algorithm": GeometryVerifier.ALGORITHM_VERSION,
+                "status": "completed",
+                "assetASourceFingerprint": candidate.assetASourceFingerprint,
+                "assetBSourceFingerprint": candidate.assetBSourceFingerprint,
+                "matchedCount": Int(result.matchedCount),
+                "inlierCount": Int(result.inlierCount),
+                "inlierRatio": inlierRatio,
+                "coverage": coverage,
+                "medianError": medianError,
+                "passed": result.passed,
+            ]
+        }
+
         private func mergedEvidence(
             _ sourceJSON: String,
             _ geometryEvidence: [String: Any]
@@ -243,6 +267,17 @@ struct GeometryVerifier {
                 return sourceJSON
             }
             return String(decoding: data, as: UTF8.self)
+        }
+    }
+}
+
+private enum GeometryVerificationError: LocalizedError {
+    case nonFiniteResult
+
+    var errorDescription: String? {
+        switch self {
+        case .nonFiniteResult:
+            return "几何验证返回了非有限数值"
         }
     }
 }

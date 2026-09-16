@@ -6,9 +6,10 @@ actor ScanCoordinator {
     private let embeddingProvider: VisionFeaturePrintProvider
     private let featureExtractor = FastFeatureExtractor()
     private let resultIndexer: ResultIndexer
-    private var activeTask: Task<Void, Never>?
-    private var pauseRequested = false
-    private var cancelRequested = false
+    private var activeTasks: [UUID: Task<Void, Never>] = [:]
+    private var activeVolumeIDs: [UUID: String] = [:]
+    private var pauseRequestedRootIDs = Set<UUID>()
+    private var cancelRequestedRootIDs = Set<UUID>()
 
     init(catalog: CatalogStore, cacheRoot: CacheRoot) {
         self.catalog = catalog
@@ -30,8 +31,12 @@ actor ScanCoordinator {
         rootURL: URL,
         existingSessionID: UUID? = nil
     ) async throws -> ScanRun {
-        guard activeTask == nil else {
+        guard activeTasks[rootID] == nil else {
             throw IndexPhotosError.scanAlreadyRunning
+        }
+        let volumeID = try volumeIdentifier(for: rootURL)
+        guard !activeVolumeIDs.values.contains(volumeID) else {
+            throw IndexPhotosError.scanAlreadyRunningOnVolume(rootURL)
         }
 
         let sessionID: UUID = if let existingSessionID {
@@ -41,11 +46,12 @@ actor ScanCoordinator {
         }
 
         let (updates, continuation) = AsyncStream<ScanProgressSnapshot>.makeStream()
-        pauseRequested = false
-        cancelRequested = false
+        pauseRequestedRootIDs.remove(rootID)
+        cancelRequestedRootIDs.remove(rootID)
         let metrics = ScanMetrics()
 
-        activeTask = Task { [weak self] in
+        activeVolumeIDs[rootID] = volumeID
+        activeTasks[rootID] = Task { [weak self] in
             guard let self else {
                 continuation.finish()
                 return
@@ -59,16 +65,27 @@ actor ScanCoordinator {
             )
         }
 
-        return ScanRun(id: sessionID, updates: updates, metrics: metrics)
+        return ScanRun(
+            id: sessionID,
+            rootID: rootID,
+            updates: updates,
+            metrics: metrics
+        )
     }
 
-    func requestPause() {
-        pauseRequested = true
+    func requestPause(rootID: UUID) {
+        guard activeTasks[rootID] != nil else {
+            return
+        }
+        pauseRequestedRootIDs.insert(rootID)
     }
 
-    func requestCancel() {
-        cancelRequested = true
-        activeTask?.cancel()
+    func requestCancel(rootID: UUID) {
+        guard activeTasks[rootID] != nil else {
+            return
+        }
+        cancelRequestedRootIDs.insert(rootID)
+        activeTasks[rootID]?.cancel()
     }
 
     private func run(
@@ -80,9 +97,10 @@ actor ScanCoordinator {
     ) async {
         defer {
             continuation.finish()
-            activeTask = nil
-            pauseRequested = false
-            cancelRequested = false
+            activeTasks[rootID] = nil
+            activeVolumeIDs[rootID] = nil
+            pauseRequestedRootIDs.remove(rootID)
+            cancelRequestedRootIDs.remove(rootID)
         }
 
         do {
@@ -117,15 +135,17 @@ actor ScanCoordinator {
 
             var processedItemCount = 0
             var lastProgressAt = ContinuousClock.now
+            var pendingRawPhotos: [String: [DiscoveredPhoto]] = [:]
+            var nonRawSiblingKeys = Set<String>()
             let cachePath = thumbnailStore.storageURL.standardizedFileURL.path
             while let item = enumerator.nextObject() as? URL {
                 try Task.checkCancellation()
 
-                if cancelRequested {
+                if cancelRequestedRootIDs.contains(rootID) {
                     throw CancellationError()
                 }
 
-                if pauseRequested {
+                if pauseRequestedRootIDs.contains(rootID) {
                     let snapshot = try await catalog.pauseSession(sessionID)
                     continuation.yield(snapshot)
                     return
@@ -141,14 +161,22 @@ actor ScanCoordinator {
 
                 do {
                     guard let photo = try discoveredPhoto(item, rootID: rootID) else { continue }
-                    processedItemCount += 1
-                    let now = ContinuousClock.now
-                    let canPublishProgress = processedItemCount.isMultiple(of: 16)
-                        || lastProgressAt.duration(to: now) >= .milliseconds(250)
-                    if canPublishProgress {
-                        lastProgressAt = now
+                    let siblingKey = PhotoTypeRegistry.siblingKey(for: item)
+                    if PhotoTypeRegistry.isRaw(item) {
+                        guard !nonRawSiblingKeys.contains(siblingKey) else {
+                            continue
+                        }
+                        pendingRawPhotos[siblingKey, default: []].append(photo)
+                        continue
                     }
-                    try await process(
+
+                    nonRawSiblingKeys.insert(siblingKey)
+                    pendingRawPhotos.removeValue(forKey: siblingKey)
+                    let canPublishProgress = advanceProgress(
+                        processedItemCount: &processedItemCount,
+                        lastProgressAt: &lastProgressAt
+                    )
+                    try await processDiscoveredPhoto(
                         photo,
                         sessionID: sessionID,
                         continuation: continuation,
@@ -166,11 +194,37 @@ actor ScanCoordinator {
                 }
             }
 
+            for rawPhotos in pendingRawPhotos.values {
+                for photo in rawPhotos {
+                    try Task.checkCancellation()
+                    if cancelRequestedRootIDs.contains(rootID) {
+                        throw CancellationError()
+                    }
+                    if pauseRequestedRootIDs.contains(rootID) {
+                        let snapshot = try await catalog.pauseSession(sessionID)
+                        continuation.yield(snapshot)
+                        return
+                    }
+
+                    let canPublishProgress = advanceProgress(
+                        processedItemCount: &processedItemCount,
+                        lastProgressAt: &lastProgressAt
+                    )
+                    try await processDiscoveredPhoto(
+                        photo,
+                        sessionID: sessionID,
+                        continuation: continuation,
+                        shouldPublishProgress: canPublishProgress,
+                        metrics: metrics
+                    )
+                }
+            }
+
             try Task.checkCancellation()
-            if cancelRequested {
+            if cancelRequestedRootIDs.contains(rootID) {
                 throw CancellationError()
             }
-            if pauseRequested {
+            if pauseRequestedRootIDs.contains(rootID) {
                 let snapshot = try await catalog.pauseSession(sessionID)
                 continuation.yield(snapshot)
                 return
@@ -185,12 +239,14 @@ actor ScanCoordinator {
                 sessionID: sessionID
             )
             continuation.yield(missingSnapshot)
+            _ = try await catalog.removeMissingAssets(rootID: rootID)
 
             try await catalog.markSessionRunning(sessionID, phase: .embedding)
             try await emitProgress(for: sessionID, continuation: continuation)
             guard try await buildEmbeddings(
                 continuation: continuation,
-                sessionID: sessionID
+                sessionID: sessionID,
+                rootID: rootID
             ) else {
                 return
             }
@@ -202,8 +258,9 @@ actor ScanCoordinator {
             try await catalog.markSessionRunning(sessionID, phase: .verify)
             try await emitProgress(for: sessionID, continuation: continuation)
             guard try await resultIndexer.verifyCandidates(
+                rootID: rootID,
                 shouldPause: { [weak self] in
-                    await self?.isPauseRequested() ?? false
+                    await self?.isPauseRequested(rootID: rootID) ?? false
                 }
             ) else {
                 let snapshot = try await catalog.pauseSession(sessionID)
@@ -239,17 +296,18 @@ actor ScanCoordinator {
 
     private func buildEmbeddings(
         continuation: AsyncStream<ScanProgressSnapshot>.Continuation,
-        sessionID: UUID
+        sessionID: UUID,
+        rootID: UUID
     ) async throws -> Bool {
-        let inputs = try await catalog.embeddingInputs()
+        let inputs = try await catalog.embeddingInputs(rootID: rootID)
         var lastProgressAt = ContinuousClock.now
 
         for input in inputs {
             try Task.checkCancellation()
-            if cancelRequested {
+            if cancelRequestedRootIDs.contains(rootID) {
                 throw CancellationError()
             }
-            if pauseRequested {
+            if pauseRequestedRootIDs.contains(rootID) {
                 let snapshot = try await catalog.pauseSession(sessionID)
                 continuation.yield(snapshot)
                 return false
@@ -373,6 +431,46 @@ actor ScanCoordinator {
         )
     }
 
+    private func processDiscoveredPhoto(
+        _ photo: DiscoveredPhoto,
+        sessionID: UUID,
+        continuation: AsyncStream<ScanProgressSnapshot>.Continuation,
+        shouldPublishProgress: Bool = true,
+        metrics: ScanMetrics
+    ) async throws {
+        do {
+            try await process(
+                photo,
+                sessionID: sessionID,
+                continuation: continuation,
+                shouldPublishProgress: shouldPublishProgress,
+                metrics: metrics
+            )
+        } catch {
+            try Task.checkCancellation()
+            let snapshot = try await catalog.recordScanFailure(
+                sessionID: sessionID,
+                path: photo.path,
+                message: error.localizedDescription
+            )
+            continuation.yield(snapshot)
+        }
+    }
+
+    private func advanceProgress(
+        processedItemCount: inout Int,
+        lastProgressAt: inout ContinuousClock.Instant
+    ) -> Bool {
+        processedItemCount += 1
+        let now = ContinuousClock.now
+        let shouldPublish = processedItemCount.isMultiple(of: 16)
+            || lastProgressAt.duration(to: now) >= .milliseconds(250)
+        if shouldPublish {
+            lastProgressAt = now
+        }
+        return shouldPublish
+    }
+
     private func completeContentHashIfNeeded(
         item: DiscoveredPhoto,
         quickFingerprint: String?,
@@ -469,7 +567,12 @@ actor ScanCoordinator {
         try await continuation.yield(catalog.progress(for: sessionID))
     }
 
-    private func isPauseRequested() -> Bool {
-        pauseRequested
+    private func isPauseRequested(rootID: UUID) -> Bool {
+        pauseRequestedRootIDs.contains(rootID)
+    }
+
+    private func volumeIdentifier(for rootURL: URL) throws -> String {
+        let values = try rootURL.resourceValues(forKeys: [.volumeIdentifierKey])
+        return values.volumeIdentifier.map(String.init(describing:)) ?? "unknown-volume"
     }
 }

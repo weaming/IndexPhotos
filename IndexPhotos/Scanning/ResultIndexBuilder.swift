@@ -40,8 +40,8 @@ enum ResultIndexBuilder {
         features: [IndexedFastFeature]
     ) throws -> [SimilarityCandidateRecord] {
         var index = PHashBKTree(capacity: features.count)
-        var candidates: [SimilarityCandidateRecord] = []
-        candidates.reserveCapacity(features.count)
+        var candidates = try makeExactCandidates(features: features)
+        candidates.reserveCapacity(features.count * 2)
         let encoder = JSONEncoder()
         let evidenceByDistance = try (0 ... PHASH_DISTANCE_THRESHOLD).map { distance in
             let evidence = PHashEvidence(perceptualHashDistance: distance, threshold: PHASH_DISTANCE_THRESHOLD)
@@ -79,6 +79,47 @@ enum ResultIndexBuilder {
         return candidates.sorted { $0.id < $1.id }
     }
 
+    private static func makeExactCandidates(
+        features: [IndexedFastFeature]
+    ) throws -> [SimilarityCandidateRecord] {
+        let groupedFeatures = Dictionary(grouping: features, by: \.contentHash)
+        let encoder = JSONEncoder()
+        var candidates: [SimilarityCandidateRecord] = []
+
+        for (contentHash, group) in groupedFeatures.sorted(by: { $0.key < $1.key }) {
+            let sortedGroup = group.sorted { $0.assetID < $1.assetID }
+            guard let representative = sortedGroup.first,
+                  sortedGroup.count > 1
+            else {
+                continue
+            }
+
+            let evidence = ExactMatchEvidence(contentHash: contentHash)
+            let evidenceJSON = String(
+                decoding: try encoder.encode(evidence),
+                as: UTF8.self
+            )
+            for feature in sortedGroup.dropFirst() {
+                let candidateID = stableID(
+                    seed: "\(EXACT_ALGORITHM_VERSION):\(contentHash):\(feature.assetID)"
+                )
+                candidates.append(
+                    SimilarityCandidateRecord(
+                        id: candidateID,
+                        assetAID: representative.assetID,
+                        assetBID: feature.assetID,
+                        relationKind: "exact_same_file",
+                        score: 1,
+                        evidenceJSON: evidenceJSON,
+                        algorithmVersion: EXACT_ALGORITHM_VERSION
+                    )
+                )
+            }
+        }
+
+        return candidates
+    }
+
     private static func stableID(seed: String) -> String {
         HashEncoding.hex(SHA256.hash(data: Data(seed.utf8)))
     }
@@ -87,6 +128,10 @@ enum ResultIndexBuilder {
 private struct PHashEvidence: Codable {
     let perceptualHashDistance: Int
     let threshold: Int
+}
+
+private struct ExactMatchEvidence: Codable {
+    let contentHash: String
 }
 
 struct PHashMatch: Equatable {

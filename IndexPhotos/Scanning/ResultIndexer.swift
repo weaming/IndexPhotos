@@ -43,13 +43,16 @@ actor ResultIndexer {
     }
 
     func verifyCandidates(
+        rootID: UUID? = nil,
         shouldPause: @Sendable () async -> Bool
     ) async throws -> Bool {
         guard let geometryVerifier else {
             return true
         }
         let candidates = try await catalog.similarityCandidates(
+            rootID: rootID,
             includeReviewed: true,
+            includeExact: false,
             limit: 5_000
         )
         var verifierSession = geometryVerifier.makeSession()

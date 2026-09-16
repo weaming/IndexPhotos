@@ -11,13 +11,18 @@ final class AppModel {
     var currentProgress = ScanProgressSnapshot.idle
     var statusMessage = "正在初始化缓存…"
     var errorMessage: String?
+    var savedRoots: [SavedRoot] = []
     var selectedRootURL: URL?
     var selectedRootID: UUID?
-    var resumableScan: ResumableScan?
-    var isScanTaskActive = false
+    var similarityRootIDs = Set<UUID>()
+    var isSimilarityMultiSelectEnabled = false
+    var resumableScans: [ResumableScan] = []
+    var rootProgress: [UUID: ScanProgressSnapshot] = [:]
+    var activeScanRootIDs = Set<UUID>()
     var similarityCandidates: [SimilarityReviewItem] = []
     var isLoadingSimilarityCandidates = false
     var showReviewedSimilarityCandidates = false
+    var similarityAlgorithmFilter = SimilarityAlgorithmFilter.all
     var similarityScoreBucket = SimilarityScoreBucket.all
     var similarityBucketCounts = Array(
         repeating: 0,
@@ -25,6 +30,8 @@ final class AppModel {
     )
     var similarityPageIndex = 0
     var similarityCandidateTotalCount = 0
+    var pendingDeletionCount = 0
+    var isDeletingPhotos = false
     var updatingSimilarityCandidateIDs = Set<String>()
 
     private let catalog: CatalogStore?
@@ -35,14 +42,40 @@ final class AppModel {
     @ObservationIgnored private var similarityTask: Task<Void, Never>?
     @ObservationIgnored private var similarityRequestID = UUID()
     private var cacheLock: CacheLock?
-    private var progressTask: Task<Void, Never>?
+    @ObservationIgnored private var progressTasks: [UUID: Task<Void, Never>] = [:]
+    private var isSimilarityScoreBucketCustomized = false
 
     var isReady: Bool {
         catalog != nil && coordinator != nil && cacheRoot != nil
     }
 
-    var isScanning: Bool {
-        isScanTaskActive
+    var isSelectedRootScanning: Bool {
+        guard let selectedRootID else {
+            return false
+        }
+        return activeScanRootIDs.contains(selectedRootID)
+    }
+
+    var selectedRootResumableScan: ResumableScan? {
+        guard let selectedRootID else {
+            return nil
+        }
+        return resumableScans.first { $0.rootID == selectedRootID }
+    }
+
+    func progress(for rootID: UUID) -> ScanProgressSnapshot {
+        rootProgress[rootID] ?? .idle
+    }
+
+    func rootName(for rootID: UUID) -> String {
+        savedRoots.first { $0.id == rootID }?.displayName ?? "照片目录"
+    }
+
+    func isSimilarityRootSelected(_ rootID: UUID) -> Bool {
+        if similarityRootIDs.isEmpty {
+            return selectedRootID == rootID
+        }
+        return similarityRootIDs.contains(rootID)
     }
 
     init() {
@@ -94,14 +127,105 @@ final class AppModel {
     }
 
     func selectDirectory(_ urls: [URL]) {
-        guard let url = urls.first else {
+        guard !urls.isEmpty else {
             return
         }
 
-        selectedRootURL = url
-        selectedRootID = StableIdentifier.rootID(for: url)
-        statusMessage = "已选择目录：\(url.path)"
+        let roots = urls.map(makeSavedRoot)
+        var mergedRoots = savedRoots
+        for root in roots {
+            if let index = mergedRoots.firstIndex(where: { $0.id == root.id }) {
+                mergedRoots[index] = root
+            } else {
+                mergedRoots.append(root)
+            }
+        }
+        savedRoots = mergedRoots.sorted {
+            if $0.id == $1.id {
+                return false
+            }
+            return $0.updatedAt > $1.updatedAt
+        }
+
+        if let root = roots.last {
+            selectRoot(root.id)
+        }
         errorMessage = nil
+
+        guard let catalog else {
+            errorMessage = "扫描服务尚未初始化。"
+            return
+        }
+        Task { [weak self] in
+            do {
+                for root in roots {
+                    try await catalog.upsertRoot(
+                        id: root.id,
+                        displayName: root.displayName,
+                        url: root.url,
+                        bookmarkData: root.bookmarkData
+                    )
+                }
+                await self?.reloadRootState(using: catalog)
+            } catch {
+                self?.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func selectRoot(_ rootID: UUID) {
+        guard let root = savedRoots.first(where: { $0.id == rootID }) else {
+            return
+        }
+
+        selectedRootID = root.id
+        selectedRootURL = resolveURL(for: root)
+        if !isSimilarityMultiSelectEnabled {
+            similarityRootIDs = [root.id]
+        }
+        if !isSimilarityScoreBucketCustomized {
+            similarityScoreBucket = .all
+        }
+        currentProgress = progress(for: root.id)
+        statusMessage = rootStatusMessage(for: root.id)
+        errorMessage = nil
+    }
+
+    func setSimilarityMultiSelectEnabled(_ isEnabled: Bool) {
+        isSimilarityMultiSelectEnabled = isEnabled
+
+        if isEnabled {
+            if similarityRootIDs.isEmpty, let selectedRootID {
+                similarityRootIDs = [selectedRootID]
+            }
+        } else if let selectedRootID {
+            similarityRootIDs = [selectedRootID]
+        } else {
+            similarityRootIDs.removeAll()
+        }
+
+        similarityPageIndex = 0
+        refreshSimilarityCandidates(resetPage: true)
+    }
+
+    func toggleSimilarityRoot(_ rootID: UUID) {
+        guard isSimilarityMultiSelectEnabled else {
+            return
+        }
+        guard savedRoots.contains(where: { $0.id == rootID }) else {
+            return
+        }
+
+        if similarityRootIDs.contains(rootID) {
+            guard similarityRootIDs.count > 1 else {
+                return
+            }
+            similarityRootIDs.remove(rootID)
+        } else {
+            similarityRootIDs.insert(rootID)
+        }
+        similarityPageIndex = 0
+        refreshSimilarityCandidates(resetPage: true)
     }
 
     func startScan() {
@@ -114,7 +238,15 @@ final class AppModel {
     }
 
     func resumeScan() {
-        guard let resumableScan else {
+        guard let selectedRootID else {
+            errorMessage = IndexPhotosError.noScanAvailable.localizedDescription
+            return
+        }
+        resumeScan(for: selectedRootID)
+    }
+
+    func resumeScan(for rootID: UUID) {
+        guard let resumableScan = resumableScans.first(where: { $0.rootID == rootID }) else {
             errorMessage = IndexPhotosError.noScanAvailable.localizedDescription
             return
         }
@@ -132,33 +264,35 @@ final class AppModel {
             }
         }
 
+        selectedRootID = rootID
         selectedRootURL = rootURL
-        selectedRootID = resumableScan.rootID
         beginScan(
-            rootID: resumableScan.rootID,
+            rootID: rootID,
             rootURL: rootURL,
             existingSessionID: resumableScan.id
         )
     }
 
     func pauseScan() {
-        guard isScanning else {
+        guard let selectedRootID, activeScanRootIDs.contains(selectedRootID) else {
+            errorMessage = "当前目录没有正在运行的扫描。"
             return
         }
 
         Task {
-            await coordinator?.requestPause()
+            await coordinator?.requestPause(rootID: selectedRootID)
         }
         statusMessage = "正在暂停，等待当前任务提交检查点…"
     }
 
     func cancelScan() {
-        guard isScanning else {
+        guard let selectedRootID, activeScanRootIDs.contains(selectedRootID) else {
+            errorMessage = "当前目录没有正在运行的扫描。"
             return
         }
 
         Task {
-            await coordinator?.requestCancel()
+            await coordinator?.requestCancel(rootID: selectedRootID)
         }
         statusMessage = "正在取消，保留已提交结果…"
     }
@@ -201,7 +335,17 @@ final class AppModel {
         guard bucket != similarityScoreBucket else {
             return
         }
+        isSimilarityScoreBucketCustomized = true
         similarityScoreBucket = bucket
+        similarityPageIndex = 0
+        refreshSimilarityCandidates(resetPage: true)
+    }
+
+    func selectSimilarityAlgorithmFilter(_ filter: SimilarityAlgorithmFilter) {
+        guard filter != similarityAlgorithmFilter else {
+            return
+        }
+        similarityAlgorithmFilter = filter
         similarityPageIndex = 0
         refreshSimilarityCandidates(resetPage: true)
     }
@@ -234,6 +378,7 @@ final class AppModel {
                 count: SimilarityScoreBucket.values.count
             )
             similarityCandidateTotalCount = 0
+            pendingDeletionCount = 0
             similarityPageIndex = 0
             isLoadingSimilarityCandidates = false
             return
@@ -244,19 +389,39 @@ final class AppModel {
         if resetPage {
             similarityPageIndex = 0
         }
-        let rootID = selectedRootID
+        let rootIDs = similarityQueryRootIDs
         let includeReviewed = showReviewedSimilarityCandidates
+        let algorithmFilter = similarityAlgorithmFilter
         let scoreBucket = similarityScoreBucket
+        let isUsingDefaultScoreBucket = !isSimilarityScoreBucketCustomized
         let pageIndex = similarityPageIndex
         let requestID = UUID()
         similarityRequestID = requestID
         similarityTask = Task { [weak self] in
             do {
                 let bucketCounts = try await catalog.similarityCandidateCounts(
-                    rootID: rootID,
-                    includeReviewed: includeReviewed
+                    rootIDs: rootIDs,
+                    includeReviewed: includeReviewed,
+                    reviewedOnly: includeReviewed,
+                    algorithmFilter: algorithmFilter
                 )
-                let visibleCount = scoreBucket.index.map {
+                let resolvedBucket: SimilarityScoreBucket = if isUsingDefaultScoreBucket,
+                                                                 let highestBucket = SimilarityScoreBucket.valuesDescending.first(where: {
+                                                                     guard let bucketIndex = $0.index else {
+                                                                         return false
+                                                                     }
+                                                                     return bucketCounts[bucketIndex] > 0
+                                                                 })
+                {
+                    highestBucket
+                } else if let bucketIndex = scoreBucket.index,
+                          bucketCounts[bucketIndex] == 0
+                {
+                    .all
+                } else {
+                    scoreBucket
+                }
+                let visibleCount = resolvedBucket.index.map {
                     bucketCounts[$0]
                 } ?? bucketCounts.reduce(0, +)
                 let pageCount = visibleCount > 0
@@ -268,12 +433,21 @@ final class AppModel {
                     max(pageCount - 1, 0)
                 )
                 let candidates = try await catalog.similarityCandidates(
-                    rootID: rootID,
+                    rootIDs: rootIDs,
                     includeReviewed: includeReviewed,
-                    scoreBucket: scoreBucket,
+                    reviewedOnly: includeReviewed,
+                    algorithmFilter: algorithmFilter,
+                    scoreBucket: resolvedBucket,
                     offset: resolvedPageIndex * Self.SIMILARITY_PAGE_SIZE,
                     limit: Self.SIMILARITY_PAGE_SIZE
                 )
+                let deletionTargets = includeReviewed
+                    ? try await catalog.similarityDeletionTargets(
+                        rootIDs: rootIDs,
+                        algorithmFilter: algorithmFilter,
+                        scoreBucket: resolvedBucket
+                    )
+                    : []
                 guard !Task.isCancelled,
                       let self,
                       self.similarityRequestID == requestID
@@ -282,6 +456,9 @@ final class AppModel {
                 }
                 self.similarityBucketCounts = bucketCounts
                 self.similarityCandidateTotalCount = bucketCounts.reduce(0, +)
+                self.pendingDeletionCount = deletionTargets.count
+                self.similarityAlgorithmFilter = algorithmFilter
+                self.similarityScoreBucket = resolvedBucket
                 self.similarityPageIndex = resolvedPageIndex
                 self.similarityCandidates = candidates
                 self.isLoadingSimilarityCandidates = false
@@ -292,6 +469,110 @@ final class AppModel {
                 }
                 self.isLoadingSimilarityCandidates = false
                 self.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private var similarityQueryRootIDs: [UUID]? {
+        if !similarityRootIDs.isEmpty {
+            return similarityRootIDs.sorted { $0.uuidString < $1.uuidString }
+        }
+        return selectedRootID.map { [$0] }
+    }
+
+    func executePendingDeletions(mode: PhotoDeletionMode) {
+        guard !isDeletingPhotos else {
+            return
+        }
+        guard let catalog, let cacheMaintenance else {
+            errorMessage = "删除服务尚未初始化。"
+            return
+        }
+
+        let rootIDs = similarityQueryRootIDs
+        let algorithmFilter = similarityAlgorithmFilter
+        let scoreBucket = similarityScoreBucket
+        isDeletingPhotos = true
+        errorMessage = nil
+
+        Task { [weak self] in
+            do {
+                let targets = try await catalog.similarityDeletionTargets(
+                    rootIDs: rootIDs,
+                    algorithmFilter: algorithmFilter,
+                    scoreBucket: scoreBucket
+                )
+                let report = try await cacheMaintenance.deletePhotos(
+                    targets,
+                    mode: mode
+                )
+                try await cacheMaintenance.rebuildResultIndexes()
+                _ = try await cacheMaintenance.removeUnreferencedObjects(limit: 4_096)
+
+                guard let self else {
+                    return
+                }
+                if report.failedPaths.isEmpty {
+                    self.statusMessage = "已\(mode.title) \(report.deletedCount) 张照片"
+                } else {
+                    self.errorMessage = "已处理 \(report.deletedCount) 张照片，以下文件失败：\n"
+                        + report.failedPaths.joined(separator: "\n")
+                }
+                self.isDeletingPhotos = false
+                self.refreshSimilarityCandidates(resetPage: true)
+            } catch {
+                guard let self else {
+                    return
+                }
+                self.isDeletingPhotos = false
+                self.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func removeSavedRoot(_ rootID: UUID) {
+        guard !activeScanRootIDs.contains(rootID) else {
+            errorMessage = "请先停止该目录的扫描，再移除目录索引。"
+            return
+        }
+        guard let catalog, let cacheMaintenance else {
+            errorMessage = "目录服务尚未初始化。"
+            return
+        }
+
+        Task { [weak self] in
+            do {
+                _ = try await catalog.removeRoot(rootID)
+                try await cacheMaintenance.rebuildResultIndexes()
+                _ = try await cacheMaintenance.removeUnreferencedObjects(limit: 4_096)
+
+                guard let self else {
+                    return
+                }
+                self.savedRoots.removeAll { $0.id == rootID }
+                self.resumableScans.removeAll { $0.rootID == rootID }
+                self.rootProgress[rootID] = nil
+                self.similarityRootIDs.remove(rootID)
+
+                if self.selectedRootID == rootID {
+                    self.selectedRootID = nil
+                    self.selectedRootURL = nil
+                    self.currentProgress = .idle
+                    self.statusMessage = "目录索引已移除"
+                    if let nextRoot = self.savedRoots.first {
+                        self.selectRoot(nextRoot.id)
+                        if self.isSimilarityMultiSelectEnabled {
+                            self.similarityRootIDs = [nextRoot.id]
+                        }
+                    }
+                } else if let selectedRootID = self.selectedRootID,
+                          self.similarityRootIDs.isEmpty
+                {
+                    self.similarityRootIDs = [selectedRootID]
+                }
+                self.refreshSimilarityCandidates(resetPage: true)
+            } catch {
+                self?.errorMessage = error.localizedDescription
             }
         }
     }
@@ -307,11 +588,13 @@ final class AppModel {
 
         updatingSimilarityCandidateIDs.insert(candidateID)
         Task { [weak self] in
+            var didSucceed = false
             do {
                 try await catalog.setReviewDecision(
                     candidateID: candidateID,
                     decision: decision
                 )
+                didSucceed = true
             } catch {
                 if !Task.isCancelled {
                     self?.errorMessage = error.localizedDescription
@@ -321,7 +604,7 @@ final class AppModel {
                 return
             }
             self.updatingSimilarityCandidateIDs.remove(candidateID)
-            if !Task.isCancelled {
+            if didSucceed, !Task.isCancelled {
                 self.refreshSimilarityCandidates()
             }
         }
@@ -338,8 +621,10 @@ final class AppModel {
 
         updatingSimilarityCandidateIDs.insert(candidateID)
         Task { [weak self] in
+            var didSucceed = false
             do {
                 try await catalog.clearReviewDecision(candidateID: candidateID)
+                didSucceed = true
             } catch {
                 if !Task.isCancelled {
                     self?.errorMessage = error.localizedDescription
@@ -349,7 +634,7 @@ final class AppModel {
                 return
             }
             self.updatingSimilarityCandidateIDs.remove(candidateID)
-            if !Task.isCancelled {
+            if didSucceed, !Task.isCancelled {
                 self.refreshSimilarityCandidates()
             }
         }
@@ -360,7 +645,7 @@ final class AppModel {
         rootURL: URL,
         existingSessionID: UUID? = nil
     ) {
-        guard !isScanning else {
+        guard !activeScanRootIDs.contains(rootID) else {
             errorMessage = IndexPhotosError.scanAlreadyRunning.localizedDescription
             return
         }
@@ -370,12 +655,18 @@ final class AppModel {
             return
         }
 
-        progressTask?.cancel()
-        isScanTaskActive = true
+        activeScanRootIDs.insert(rootID)
         errorMessage = nil
-        statusMessage = "正在准备扫描…"
+        if selectedRootID == rootID {
+            statusMessage = "正在准备扫描…"
+            currentProgress = progress(for: rootID)
+        }
 
-        progressTask = Task { [weak self] in
+        progressTasks[rootID] = Task { [weak self] in
+            defer {
+                self?.finishScan(rootID: rootID)
+            }
+
             do {
                 let bookmarkData = try? rootURL.bookmarkData(
                     options: .withSecurityScope,
@@ -400,10 +691,12 @@ final class AppModel {
                     guard !Task.isCancelled else {
                         return
                     }
-                    self?.apply(snapshot)
+                    self?.apply(snapshot, for: rootID)
                 }
 
-                if self?.currentProgress.status == .completed {
+                if self?.rootProgress[rootID]?.status == .completed,
+                   self?.selectedRootID == rootID
+                {
                     do {
                         let summary = try await catalog.resultSummary()
                         self?.statusMessage = "扫描完成：\(summary.duplicateGroupCount) 个重复组，\(summary.similarityCandidateCount) 个相似候选"
@@ -413,14 +706,29 @@ final class AppModel {
                     }
                 }
 
-                self?.isScanTaskActive = false
-                self?.resumableScan = try? await catalog.latestResumableScan()
+                if self?.rootProgress[rootID]?.status == .completed,
+                   let maintenance = self?.cacheMaintenance
+                {
+                    do {
+                        _ = try await maintenance.removeUnreferencedObjects(limit: 4_096)
+                    } catch {
+                        self?.errorMessage = error.localizedDescription
+                    }
+                }
+
+                await self?.reloadRootState(using: catalog)
             } catch {
-                self?.isScanTaskActive = false
-                self?.errorMessage = error.localizedDescription
-                self?.statusMessage = "扫描启动失败"
+                if self?.selectedRootID == rootID {
+                    self?.errorMessage = error.localizedDescription
+                    self?.statusMessage = "扫描启动失败"
+                }
             }
         }
+    }
+
+    private func finishScan(rootID: UUID) {
+        activeScanRootIDs.remove(rootID)
+        progressTasks[rootID] = nil
     }
 
     private func restoreInterruptedScan(
@@ -429,7 +737,13 @@ final class AppModel {
     ) async {
         do {
             try await catalog.recoverInterruptedSessions()
-            resumableScan = try await catalog.latestResumableScan()
+            savedRoots = try await catalog.savedRoots()
+            rootProgress = try await catalog.latestScanProgressesByRoot()
+            resumableScans = try await catalog.resumableScans()
+
+            if selectedRootID == nil, let firstRoot = savedRoots.first {
+                selectRoot(firstRoot.id)
+            }
 
             if let maintenance {
                 do {
@@ -441,7 +755,7 @@ final class AppModel {
                 }
             }
 
-            if resumableScan != nil {
+            if !resumableScans.isEmpty {
                 statusMessage = "发现可继续的扫描任务"
             } else {
                 statusMessage = "缓存已就绪"
@@ -453,9 +767,31 @@ final class AppModel {
         }
     }
 
-    private func apply(_ snapshot: ScanProgressSnapshot) {
+    private func reloadRootState(using catalog: CatalogStore) async {
+        do {
+            savedRoots = try await catalog.savedRoots()
+            rootProgress = try await catalog.latestScanProgressesByRoot()
+            resumableScans = try await catalog.resumableScans()
+            if let selectedRootID,
+               let progress = rootProgress[selectedRootID]
+            {
+                currentProgress = progress
+                statusMessage = rootStatusMessage(for: selectedRootID)
+            }
+        } catch {
+            if !Task.isCancelled {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func apply(_ snapshot: ScanProgressSnapshot, for rootID: UUID) {
+        rootProgress[rootID] = snapshot
+        guard selectedRootID == rootID else {
+            return
+        }
+
         currentProgress = snapshot
-        resumableScan = nil
 
         switch snapshot.status {
         case .running:
@@ -470,6 +806,53 @@ final class AppModel {
             statusMessage = "扫描失败"
         case .queued, .pausing, .recovering:
             statusMessage = phaseMessage(snapshot.phase)
+        }
+    }
+
+    private func makeSavedRoot(_ url: URL) -> SavedRoot {
+        SavedRoot(
+            id: StableIdentifier.rootID(for: url),
+            displayName: url.lastPathComponent,
+            url: url,
+            bookmarkData: try? url.bookmarkData(
+                options: .withSecurityScope,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            ),
+            updatedAt: .now
+        )
+    }
+
+    private func resolveURL(for root: SavedRoot) -> URL {
+        guard let bookmarkData = root.bookmarkData else {
+            return root.url
+        }
+
+        var isStale = false
+        return (try? URL(
+            resolvingBookmarkData: bookmarkData,
+            options: [.withSecurityScope],
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        )) ?? root.url
+    }
+
+    private func rootStatusMessage(for rootID: UUID) -> String {
+        guard let progress = rootProgress[rootID] else {
+            return "尚未扫描"
+        }
+
+        switch progress.status {
+        case .queued, .running, .pausing, .recovering:
+            return phaseMessage(progress.phase)
+        case .paused:
+            return "已暂停，可继续"
+        case .cancelled:
+            return "已取消"
+        case .completed:
+            return "已完成"
+        case .failed:
+            return "扫描失败"
         }
     }
 

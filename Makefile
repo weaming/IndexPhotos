@@ -39,7 +39,7 @@ app: FORCE
 	@echo "应用已生成：$(APP_OUTPUT)"
 
 open:
-	@open "$(APP_OUTPUT)"
+	open "$(APP_OUTPUT)"
 
 clean: FORCE
 	@if [ -e "$(XCODE_DERIVED_DATA)" ]; then /usr/bin/trash "$(XCODE_DERIVED_DATA)"; fi
