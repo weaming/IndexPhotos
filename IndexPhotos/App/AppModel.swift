@@ -4,6 +4,8 @@ import Observation
 @MainActor
 @Observable
 final class AppModel {
+    private static let SIMILARITY_PAGE_SIZE = 24
+
     let cachePath: String
 
     var currentProgress = ScanProgressSnapshot.idle
@@ -16,6 +18,14 @@ final class AppModel {
     var similarityCandidates: [SimilarityReviewItem] = []
     var isLoadingSimilarityCandidates = false
     var showReviewedSimilarityCandidates = false
+    var similarityScoreBucket = SimilarityScoreBucket.all
+    var similarityBucketCounts = Array(
+        repeating: 0,
+        count: SimilarityScoreBucket.values.count
+    )
+    var similarityPageIndex = 0
+    var similarityCandidateTotalCount = 0
+    var updatingSimilarityCandidateIDs = Set<String>()
 
     private let catalog: CatalogStore?
     private let coordinator: ScanCoordinator?
@@ -23,6 +33,7 @@ final class AppModel {
     private let cacheMaintenance: CacheMaintenance?
     let thumbnailCacheURL: URL?
     @ObservationIgnored private var similarityTask: Task<Void, Never>?
+    @ObservationIgnored private var similarityRequestID = UUID()
     private var cacheLock: CacheLock?
     private var progressTask: Task<Void, Never>?
 
@@ -152,32 +163,135 @@ final class AppModel {
         statusMessage = "正在取消，保留已提交结果…"
     }
 
-    func refreshSimilarityCandidates() {
+    var similarityVisibleCount: Int {
+        guard let bucketIndex = similarityScoreBucket.index else {
+            return similarityCandidateTotalCount
+        }
+        return similarityBucketCounts[bucketIndex]
+    }
+
+    var similarityPageCount: Int {
+        guard similarityVisibleCount > 0 else {
+            return 0
+        }
+        return (similarityVisibleCount + Self.SIMILARITY_PAGE_SIZE - 1)
+            / Self.SIMILARITY_PAGE_SIZE
+    }
+
+    var similarityPageNumber: Int {
+        min(similarityPageIndex + 1, max(similarityPageCount, 1))
+    }
+
+    var hasPreviousSimilarityPage: Bool {
+        similarityPageIndex > 0
+    }
+
+    var hasNextSimilarityPage: Bool {
+        similarityPageIndex + 1 < similarityPageCount
+    }
+
+    func similarityBucketCount(for bucket: SimilarityScoreBucket) -> Int {
+        guard let bucketIndex = bucket.index else {
+            return similarityCandidateTotalCount
+        }
+        return similarityBucketCounts[bucketIndex]
+    }
+
+    func selectSimilarityScoreBucket(_ bucket: SimilarityScoreBucket) {
+        guard bucket != similarityScoreBucket else {
+            return
+        }
+        similarityScoreBucket = bucket
+        similarityPageIndex = 0
+        refreshSimilarityCandidates(resetPage: true)
+    }
+
+    func toggleReviewedSimilarityCandidates() {
+        showReviewedSimilarityCandidates.toggle()
+        similarityPageIndex = 0
+        refreshSimilarityCandidates(resetPage: true)
+    }
+
+    func setSimilarityPage(_ pageIndex: Int) {
+        let maximumPageIndex = max(similarityPageCount - 1, 0)
+        let nextPageIndex = min(max(pageIndex, 0), maximumPageIndex)
+        guard nextPageIndex != similarityPageIndex else {
+            return
+        }
+        similarityPageIndex = nextPageIndex
+        refreshSimilarityCandidates()
+    }
+
+    func isUpdatingSimilarityCandidate(_ candidateID: String) -> Bool {
+        updatingSimilarityCandidateIDs.contains(candidateID)
+    }
+
+    func refreshSimilarityCandidates(resetPage: Bool = false) {
         guard let catalog else {
             similarityCandidates = []
+            similarityBucketCounts = Array(
+                repeating: 0,
+                count: SimilarityScoreBucket.values.count
+            )
+            similarityCandidateTotalCount = 0
+            similarityPageIndex = 0
             isLoadingSimilarityCandidates = false
             return
         }
 
         similarityTask?.cancel()
         isLoadingSimilarityCandidates = true
+        if resetPage {
+            similarityPageIndex = 0
+        }
         let rootID = selectedRootID
         let includeReviewed = showReviewedSimilarityCandidates
+        let scoreBucket = similarityScoreBucket
+        let pageIndex = similarityPageIndex
+        let requestID = UUID()
+        similarityRequestID = requestID
         similarityTask = Task { [weak self] in
             do {
-                let candidates = try await catalog.similarityCandidates(
+                let bucketCounts = try await catalog.similarityCandidateCounts(
                     rootID: rootID,
                     includeReviewed: includeReviewed
                 )
-                guard !Task.isCancelled else {
+                let visibleCount = scoreBucket.index.map {
+                    bucketCounts[$0]
+                } ?? bucketCounts.reduce(0, +)
+                let pageCount = visibleCount > 0
+                    ? (visibleCount + Self.SIMILARITY_PAGE_SIZE - 1)
+                        / Self.SIMILARITY_PAGE_SIZE
+                    : 0
+                let resolvedPageIndex = min(
+                    pageIndex,
+                    max(pageCount - 1, 0)
+                )
+                let candidates = try await catalog.similarityCandidates(
+                    rootID: rootID,
+                    includeReviewed: includeReviewed,
+                    scoreBucket: scoreBucket,
+                    offset: resolvedPageIndex * Self.SIMILARITY_PAGE_SIZE,
+                    limit: Self.SIMILARITY_PAGE_SIZE
+                )
+                guard !Task.isCancelled,
+                      let self,
+                      self.similarityRequestID == requestID
+                else {
                     return
                 }
-                self?.similarityCandidates = candidates
-                self?.isLoadingSimilarityCandidates = false
+                self.similarityBucketCounts = bucketCounts
+                self.similarityCandidateTotalCount = bucketCounts.reduce(0, +)
+                self.similarityPageIndex = resolvedPageIndex
+                self.similarityCandidates = candidates
+                self.isLoadingSimilarityCandidates = false
             } catch is CancellationError {
             } catch {
-                self?.isLoadingSimilarityCandidates = false
-                self?.errorMessage = error.localizedDescription
+                guard let self, self.similarityRequestID == requestID else {
+                    return
+                }
+                self.isLoadingSimilarityCandidates = false
+                self.errorMessage = error.localizedDescription
             }
         }
     }
@@ -187,19 +301,28 @@ final class AppModel {
             errorMessage = "审核服务尚未初始化。"
             return
         }
+        guard !updatingSimilarityCandidateIDs.contains(candidateID) else {
+            return
+        }
 
+        updatingSimilarityCandidateIDs.insert(candidateID)
         Task { [weak self] in
             do {
                 try await catalog.setReviewDecision(
                     candidateID: candidateID,
                     decision: decision
                 )
-                guard !Task.isCancelled else {
-                    return
-                }
-                self?.refreshSimilarityCandidates()
             } catch {
-                self?.errorMessage = error.localizedDescription
+                if !Task.isCancelled {
+                    self?.errorMessage = error.localizedDescription
+                }
+            }
+            guard let self else {
+                return
+            }
+            self.updatingSimilarityCandidateIDs.remove(candidateID)
+            if !Task.isCancelled {
+                self.refreshSimilarityCandidates()
             }
         }
     }
@@ -209,16 +332,25 @@ final class AppModel {
             errorMessage = "审核服务尚未初始化。"
             return
         }
+        guard !updatingSimilarityCandidateIDs.contains(candidateID) else {
+            return
+        }
 
+        updatingSimilarityCandidateIDs.insert(candidateID)
         Task { [weak self] in
             do {
                 try await catalog.clearReviewDecision(candidateID: candidateID)
-                guard !Task.isCancelled else {
-                    return
-                }
-                self?.refreshSimilarityCandidates()
             } catch {
-                self?.errorMessage = error.localizedDescription
+                if !Task.isCancelled {
+                    self?.errorMessage = error.localizedDescription
+                }
+            }
+            guard let self else {
+                return
+            }
+            self.updatingSimilarityCandidateIDs.remove(candidateID)
+            if !Task.isCancelled {
+                self.refreshSimilarityCandidates()
             }
         }
     }

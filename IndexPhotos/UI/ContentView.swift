@@ -258,7 +258,7 @@ private struct ScanDashboardView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .task(id: model.selectedRootID) {
-            model.refreshSimilarityCandidates()
+            model.refreshSimilarityCandidates(resetPage: true)
         }
     }
 }
@@ -269,19 +269,25 @@ private struct SimilarityCandidatesPanel: View {
     var body: some View {
         GroupBox("相似候选") {
             VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text(
-                        model.showReviewedSimilarityCandidates
-                            ? "显示全部候选"
-                            : "待人工处理 \(model.similarityCandidates.count) 项"
-                    )
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(
+                            model.showReviewedSimilarityCandidates
+                                ? "显示全部候选"
+                                : "待人工处理"
+                        )
+                        Text("\(model.similarityVisibleCount) 项")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     .foregroundStyle(.secondary)
 
                     Spacer()
 
+                    SimilarityScoreBucketMenu()
+
                     Button {
-                        model.showReviewedSimilarityCandidates.toggle()
-                        model.refreshSimilarityCandidates()
+                        model.toggleReviewedSimilarityCandidates()
                     } label: {
                         Label(
                             model.showReviewedSimilarityCandidates
@@ -293,7 +299,9 @@ private struct SimilarityCandidatesPanel: View {
                     .buttonStyle(.bordered)
                 }
 
-                if model.isLoadingSimilarityCandidates {
+                if model.similarityCandidates.isEmpty,
+                   model.isLoadingSimilarityCandidates
+                {
                     ProgressView("正在读取相似候选…")
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else if model.similarityCandidates.isEmpty {
@@ -308,23 +316,35 @@ private struct SimilarityCandidatesPanel: View {
                     }
                     .frame(maxWidth: .infinity)
                 } else {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(model.similarityCandidates) { candidate in
-                            SimilarityCandidateRow(
-                                candidate: candidate,
-                                thumbnailRootURL: model.thumbnailCacheURL,
-                                onDecision: { decision in
-                                    model.reviewCandidate(
-                                        candidate.id,
-                                        decision: decision
-                                    )
-                                },
-                                onClearDecision: {
-                                    model.clearReviewDecision(candidate.id)
-                                }
-                            )
+                    ZStack(alignment: .topTrailing) {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            ForEach(model.similarityCandidates) { candidate in
+                                SimilarityCandidateRow(
+                                    candidate: candidate,
+                                    thumbnailRootURL: model.thumbnailCacheURL,
+                                    isUpdating: model.isUpdatingSimilarityCandidate(candidate.id),
+                                    onDecision: { decision in
+                                        model.reviewCandidate(
+                                            candidate.id,
+                                            decision: decision
+                                        )
+                                    },
+                                    onClearDecision: {
+                                        model.clearReviewDecision(candidate.id)
+                                    }
+                                )
+                            }
+                        }
+
+                        if model.isLoadingSimilarityCandidates {
+                            ProgressView()
+                                .controlSize(.small)
+                                .padding(8)
+                                .background(.regularMaterial, in: Capsule())
                         }
                     }
+
+                    SimilarityCandidatesPagination()
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -332,9 +352,79 @@ private struct SimilarityCandidatesPanel: View {
     }
 }
 
+private struct SimilarityScoreBucketMenu: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Menu {
+            Button {
+                model.selectSimilarityScoreBucket(.all)
+            } label: {
+                Text(menuTitle(for: .all))
+            }
+
+            Divider()
+
+            ForEach(SimilarityScoreBucket.valuesDescending) { bucket in
+                Button {
+                    model.selectSimilarityScoreBucket(bucket)
+                } label: {
+                    Text(menuTitle(for: bucket))
+                }
+            }
+        } label: {
+            Label(
+                "区间：\(model.similarityScoreBucket.title)",
+                systemImage: "slider.horizontal.3"
+            )
+        }
+        .menuStyle(.borderlessButton)
+    }
+
+    private func menuTitle(for bucket: SimilarityScoreBucket) -> String {
+        let marker = bucket == model.similarityScoreBucket ? "✓ " : ""
+        return "\(marker)\(bucket.title)（\(model.similarityBucketCount(for: bucket))）"
+    }
+}
+
+private struct SimilarityCandidatesPagination: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("每页 24 项")
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button {
+                model.setSimilarityPage(model.similarityPageIndex - 1)
+            } label: {
+                Label("上一页", systemImage: "chevron.left")
+            }
+            .buttonStyle(.bordered)
+            .disabled(!model.hasPreviousSimilarityPage || model.isLoadingSimilarityCandidates)
+
+            Text("第 \(model.similarityPageNumber) / \(max(model.similarityPageCount, 1)) 页")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Button {
+                model.setSimilarityPage(model.similarityPageIndex + 1)
+            } label: {
+                Label("下一页", systemImage: "chevron.right")
+            }
+            .buttonStyle(.bordered)
+            .disabled(!model.hasNextSimilarityPage || model.isLoadingSimilarityCandidates)
+        }
+        .font(.caption)
+    }
+}
+
 private struct SimilarityCandidateRow: View {
     let candidate: SimilarityReviewItem
     let thumbnailRootURL: URL?
+    let isUpdating: Bool
     let onDecision: (ReviewDecision) -> Void
     let onClearDecision: () -> Void
 
@@ -343,6 +433,7 @@ private struct SimilarityCandidateRow: View {
             HStack(alignment: .top, spacing: 16) {
                 CandidatePhotoCard(
                     path: candidate.assetAPath,
+                    sizeBytes: candidate.assetASizeBytes,
                     thumbnailRootURL: thumbnailRootURL,
                     thumbnailRelativePath: candidate.thumbnailARelativePath
                 )
@@ -354,6 +445,7 @@ private struct SimilarityCandidateRow: View {
 
                 CandidatePhotoCard(
                     path: candidate.assetBPath,
+                    sizeBytes: candidate.assetBSizeBytes,
                     thumbnailRootURL: thumbnailRootURL,
                     thumbnailRelativePath: candidate.thumbnailBRelativePath
                 )
@@ -380,16 +472,25 @@ private struct SimilarityCandidateRow: View {
                         onClearDecision()
                     }
                 } else {
-                    Button("保留") {
+                    Button("保留两张") {
                         onDecision(.keep)
                     }
-                    Button("后续处理") {
-                        onDecision(.process)
+                    Button("删除左图", role: .destructive) {
+                        onDecision(.deleteA)
                     }
-                    Button("忽略") {
+                    Button("删除右图", role: .destructive) {
+                        onDecision(.deleteB)
+                    }
+                    Button("跳过") {
                         onDecision(.ignore)
                     }
                 }
+            }
+            .disabled(isUpdating)
+
+            if isUpdating {
+                ProgressView()
+                    .controlSize(.small)
             }
         }
         .padding(12)
@@ -399,17 +500,22 @@ private struct SimilarityCandidateRow: View {
     private func reviewDecisionTitle(_ decision: ReviewDecision) -> String {
         switch decision {
         case .keep:
-            return "已保留"
+            return "已标记保留两张"
+        case .deleteA:
+            return "已标记删除左图"
+        case .deleteB:
+            return "已标记删除右图"
         case .process:
-            return "已标记后续处理"
+            return "已审核"
         case .ignore:
-            return "已忽略"
+            return "已跳过"
         }
     }
 }
 
 private struct CandidatePhotoCard: View {
     let path: String
+    let sizeBytes: Int64
     let thumbnailRootURL: URL?
     let thumbnailRelativePath: String?
 
@@ -425,6 +531,10 @@ private struct CandidatePhotoCard: View {
                 .lineLimit(1)
                 .help(path)
 
+            Text("\(sizeInMB, format: .number.precision(.fractionLength(2))) MB")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
             Text(path)
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
@@ -439,6 +549,10 @@ private struct CandidatePhotoCard: View {
             .buttonStyle(.link)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var sizeInMB: Double {
+        Double(max(sizeBytes, 0)) / 1_000_000
     }
 }
 

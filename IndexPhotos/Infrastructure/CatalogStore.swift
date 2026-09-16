@@ -779,17 +779,62 @@ actor CatalogStore {
         )
     }
 
+    func similarityCandidateCounts(
+        rootID: UUID? = nil,
+        includeReviewed: Bool = false
+    ) throws -> [Int] {
+        let statement = try prepare(
+            """
+            SELECT
+                SUM(CASE WHEN c.score < 0.1 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.score >= 0.1 AND c.score < 0.2 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.score >= 0.2 AND c.score < 0.3 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.score >= 0.3 AND c.score < 0.4 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.score >= 0.4 AND c.score < 0.5 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.score >= 0.5 AND c.score < 0.6 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.score >= 0.6 AND c.score < 0.7 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.score >= 0.7 AND c.score < 0.8 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.score >= 0.8 AND c.score < 0.9 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.score >= 0.9 THEN 1 ELSE 0 END)
+            FROM similarity_candidates AS c
+            JOIN assets AS a ON a.id = c.asset_a_id
+            JOIN assets AS b ON b.id = c.asset_b_id
+            LEFT JOIN review_decisions AS d ON d.candidate_id = c.id
+            WHERE a.state = 'active'
+              AND b.state = 'active'
+              AND (? IS NULL OR a.root_id = ?)
+              AND (? = 1 OR d.decision IS NULL);
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        let rootValue = rootID?.uuidString
+        try bind(rootValue, at: 1, to: statement)
+        try bind(rootValue, at: 2, to: statement)
+        try bind(Int64(includeReviewed ? 1 : 0), at: 3, to: statement)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw IndexPhotosError.database("读取相似候选分桶统计失败")
+        }
+
+        return (0..<SimilarityScoreBucket.values.count).map { index in
+            Int(sqlite3_column_int64(statement, Int32(index)))
+        }
+    }
+
     func similarityCandidates(
         rootID: UUID? = nil,
         includeReviewed: Bool = false,
-        limit: Int = 500
+        scoreBucket: SimilarityScoreBucket = .all,
+        offset: Int = 0,
+        limit: Int = 24
     ) throws -> [SimilarityReviewItem] {
         let statement = try prepare(
             """
             SELECT
                 c.id,
-                a.id, a.path, a.source_fingerprint, fa.value,
-                b.id, b.path, b.source_fingerprint, fb.value,
+                a.id, a.path, a.size_bytes, a.source_fingerprint, fa.value,
+                b.id, b.path, b.size_bytes, b.source_fingerprint, fb.value,
                 c.relation_kind, c.score, c.evidence_json,
                 c.algorithm_version, d.decision
             FROM similarity_candidates AS c
@@ -808,8 +853,10 @@ actor CatalogStore {
               AND b.state = 'active'
               AND (? IS NULL OR a.root_id = ?)
               AND (? = 1 OR d.decision IS NULL)
+              AND (? IS NULL OR c.score >= ?)
+              AND (? IS NULL OR c.score < ?)
             ORDER BY c.score DESC, c.id ASC
-            LIMIT ?;
+            LIMIT ? OFFSET ?;
             """
         )
         defer { sqlite3_finalize(statement) }
@@ -818,7 +865,12 @@ actor CatalogStore {
         try bind(rootValue, at: 1, to: statement)
         try bind(rootValue, at: 2, to: statement)
         try bind(Int64(includeReviewed ? 1 : 0), at: 3, to: statement)
-        try bind(Int64(max(limit, 0)), at: 4, to: statement)
+        try bind(scoreBucket.lowerBound, at: 4, to: statement)
+        try bind(scoreBucket.lowerBound, at: 5, to: statement)
+        try bind(scoreBucket.upperBound, at: 6, to: statement)
+        try bind(scoreBucket.upperBound, at: 7, to: statement)
+        try bind(Int64(max(limit, 0)), at: 8, to: statement)
+        try bind(Int64(max(offset, 0)), at: 9, to: statement)
 
         var candidates: [SimilarityReviewItem] = []
         while true {
@@ -832,19 +884,19 @@ actor CatalogStore {
             guard let candidateID = columnText(statement, index: 0),
                   let assetAID = columnText(statement, index: 1),
                   let assetAPath = columnText(statement, index: 2),
-                  let assetASourceFingerprint = columnText(statement, index: 3),
-                  let assetBID = columnText(statement, index: 5),
-                  let assetBPath = columnText(statement, index: 6),
-                  let assetBSourceFingerprint = columnText(statement, index: 7),
-                  let relationKind = columnText(statement, index: 9),
-                  let evidenceJSON = columnText(statement, index: 11),
-                  let algorithmVersion = columnText(statement, index: 12)
+                  let assetASourceFingerprint = columnText(statement, index: 4),
+                  let assetBID = columnText(statement, index: 6),
+                  let assetBPath = columnText(statement, index: 7),
+                  let assetBSourceFingerprint = columnText(statement, index: 9),
+                  let relationKind = columnText(statement, index: 11),
+                  let evidenceJSON = columnText(statement, index: 13),
+                  let algorithmVersion = columnText(statement, index: 14)
             else {
                 continue
             }
 
             let decision: ReviewDecision?
-            if let decisionValue = columnText(statement, index: 13) {
+            if let decisionValue = columnText(statement, index: 15) {
                 guard let decodedDecision = ReviewDecision(rawValue: decisionValue) else {
                     throw IndexPhotosError.database("未知审核决定：\(decisionValue)")
                 }
@@ -854,24 +906,26 @@ actor CatalogStore {
             }
 
             let thumbnailAPath = decodeThumbnailPath(
-                from: columnData(statement, index: 4)
+                from: columnData(statement, index: 5)
             )
             let thumbnailBPath = decodeThumbnailPath(
-                from: columnData(statement, index: 8)
+                from: columnData(statement, index: 10)
             )
             candidates.append(
                 SimilarityReviewItem(
                     id: candidateID,
                     assetAID: assetAID,
                     assetAPath: assetAPath,
+                    assetASizeBytes: sqlite3_column_int64(statement, 3),
                     assetASourceFingerprint: assetASourceFingerprint,
                     thumbnailARelativePath: thumbnailAPath,
                     assetBID: assetBID,
                     assetBPath: assetBPath,
+                    assetBSizeBytes: sqlite3_column_int64(statement, 8),
                     assetBSourceFingerprint: assetBSourceFingerprint,
                     thumbnailBRelativePath: thumbnailBPath,
                     relationKind: relationKind,
-                    score: sqlite3_column_double(statement, 10),
+                    score: sqlite3_column_double(statement, 12),
                     evidenceJSON: evidenceJSON,
                     algorithmVersion: algorithmVersion,
                     decision: decision
@@ -1822,6 +1876,16 @@ actor CatalogStore {
         guard sqlite3_bind_double(statement, index, value) == SQLITE_OK else {
             throw IndexPhotosError.database("绑定小数参数失败")
         }
+    }
+
+    private func bind(_ value: Double?, at index: Int32, to statement: OpaquePointer) throws {
+        guard let value else {
+            guard sqlite3_bind_null(statement, index) == SQLITE_OK else {
+                throw IndexPhotosError.database("绑定空小数参数失败")
+            }
+            return
+        }
+        try bind(value, at: index, to: statement)
     }
 
     private func bind(_ value: Data?, at index: Int32, to statement: OpaquePointer) throws {

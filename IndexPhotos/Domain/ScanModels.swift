@@ -140,18 +140,63 @@ struct SimilarityCandidateRecord: Sendable {
 
 enum ReviewDecision: String, Codable, Sendable {
     case keep
+    case deleteA = "delete_a"
+    case deleteB = "delete_b"
     case process
     case ignore
+}
+
+struct SimilarityScoreBucket: Hashable, Identifiable, Sendable {
+    static let all = SimilarityScoreBucket(index: nil)
+    static let values = (0..<10).map { SimilarityScoreBucket(index: $0) }
+    static let valuesDescending = values.reversed()
+
+    let index: Int?
+
+    init(index: Int?) {
+        self.index = index
+    }
+
+    var id: String {
+        index.map(String.init) ?? "all"
+    }
+
+    var lowerBound: Double? {
+        guard let index, index > 0 else {
+            return nil
+        }
+        return Double(index) / 10
+    }
+
+    var upperBound: Double? {
+        guard let index, index < 9 else {
+            return nil
+        }
+        return Double(index + 1) / 10
+    }
+
+    var title: String {
+        guard let index else {
+            return "全部"
+        }
+        return String(
+            format: "%.1f–%.1f",
+            Double(index) / 10,
+            Double(index + 1) / 10
+        )
+    }
 }
 
 struct SimilarityReviewItem: Identifiable, Equatable, Sendable {
     let id: String
     let assetAID: String
     let assetAPath: String
+    let assetASizeBytes: Int64
     let assetASourceFingerprint: String
     let thumbnailARelativePath: String?
     let assetBID: String
     let assetBPath: String
+    let assetBSizeBytes: Int64
     let assetBSourceFingerprint: String
     let thumbnailBRelativePath: String?
     let relationKind: String

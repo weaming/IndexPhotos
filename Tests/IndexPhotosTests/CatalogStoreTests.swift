@@ -537,6 +537,11 @@ final class CatalogStoreTests: XCTestCase {
             rootID: rootID
         )
         XCTAssertEqual(initialCandidates.count, 2)
+        XCTAssertEqual(initialCandidates.first?.assetASizeBytes, 1024)
+        XCTAssertEqual(initialCandidates.first?.assetBSizeBytes, 1024)
+        let bucketCounts = try await catalog.similarityCandidateCounts(rootID: rootID)
+        XCTAssertEqual(bucketCounts.reduce(0, +), 2)
+        XCTAssertEqual(bucketCounts[9], 2)
         let geometryEvidence = #"{"geometry":{"algorithm":"test-geometry-v1","status":"completed"}}"#
         let geometryCandidate = try XCTUnwrap(initialCandidates.first)
         try await catalog.updateSimilarityEvidence(
@@ -560,8 +565,8 @@ final class CatalogStoreTests: XCTestCase {
         let reviewedCandidate = try XCTUnwrap(pendingCandidates.first)
         try await catalog.setReviewDecision(
             candidateID: reviewedCandidate.id,
-            decision: .process,
-            note: "待后续人工处理"
+            decision: .deleteA,
+            note: "标记删除左图"
         )
 
         let remainingCandidates = try await catalog.similarityCandidates(
@@ -576,7 +581,7 @@ final class CatalogStoreTests: XCTestCase {
         XCTAssertEqual(allCandidates.count, 2)
         XCTAssertEqual(
             allCandidates.first(where: { $0.id == reviewedCandidate.id })?.decision,
-            .process
+            .deleteA
         )
 
         try await catalog.clearReviewDecision(candidateID: reviewedCandidate.id)
