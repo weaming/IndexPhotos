@@ -2,6 +2,16 @@ import Foundation
 import SQLite3
 
 actor CatalogStore {
+    private enum SimilarityQueryBinding {
+        case text(String)
+        case double(Double)
+    }
+
+    private struct SimilarityQueryParts {
+        var predicates: [String]
+        var bindings: [SimilarityQueryBinding]
+    }
+
     private var database: OpaquePointer?
     private let dateFormatter = ISO8601DateFormatter()
 
@@ -910,47 +920,37 @@ actor CatalogStore {
         algorithmFilter: SimilarityAlgorithmFilter = .all
     ) throws -> [Int] {
         let rootFilter = makeRootFilter(rootIDs)
+        let queryParts = makeSimilarityQueryParts(
+            rootFilter: rootFilter,
+            includeReviewed: includeReviewed,
+            reviewedOnly: reviewedOnly,
+            algorithmFilter: algorithmFilter
+        )
+        let bucketProjection = SimilarityScoreBucket.values.map { bucket in
+            let lowerBound = bucket.index.map { "0.\($0)" } ?? "0.0"
+            if let upperIndex = bucket.index.map({ $0 + 1 }),
+               upperIndex < 10
+            {
+                let upperLiteral = "0.\(upperIndex)"
+                return "SUM(CASE WHEN c.score >= \(lowerBound) AND c.score < \(upperLiteral) THEN 1 ELSE 0 END)"
+            }
+            return "SUM(CASE WHEN c.score >= \(lowerBound) THEN 1 ELSE 0 END)"
+        }
         let statement = try prepare(
             """
             SELECT
-                SUM(CASE WHEN c.score < 0.1 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN c.score >= 0.1 AND c.score < 0.2 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN c.score >= 0.2 AND c.score < 0.3 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN c.score >= 0.3 AND c.score < 0.4 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN c.score >= 0.4 AND c.score < 0.5 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN c.score >= 0.5 AND c.score < 0.6 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN c.score >= 0.6 AND c.score < 0.7 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN c.score >= 0.7 AND c.score < 0.8 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN c.score >= 0.8 AND c.score < 0.9 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN c.score >= 0.9 THEN 1 ELSE 0 END)
+                \(bucketProjection.joined(separator: ",\n                "))
             FROM similarity_candidates AS c
             JOIN assets AS a ON a.id = c.asset_a_id
             JOIN assets AS b ON b.id = c.asset_b_id
             LEFT JOIN review_decisions AS d ON d.candidate_id = c.id
-            WHERE a.state = 'active'
-              AND b.state = 'active'
-              AND \(rootFilter.clause)
-              AND (? = 1 OR (d.decision IS NULL AND c.score > ?))
-              AND (? = 0 OR d.decision IS NOT NULL)
-              AND (? IS NULL OR c.algorithm_version = ?);
+            WHERE \(queryParts.predicates.joined(separator: "\n              AND "));
             """
         )
         defer { sqlite3_finalize(statement) }
 
         var parameterIndex: Int32 = 1
-        for rootValue in rootFilter.values {
-            try bind(rootValue, at: parameterIndex, to: statement)
-            parameterIndex += 1
-        }
-        try bind(Int64(includeReviewed ? 1 : 0), at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(SimilarityReviewPolicy.MIN_SCORE, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(Int64(reviewedOnly ? 1 : 0), at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
+        try bind(queryParts.bindings, startingAt: &parameterIndex, to: statement)
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
             throw IndexPhotosError.database("读取相似候选分桶统计失败")
@@ -968,7 +968,7 @@ actor CatalogStore {
         algorithmFilter: SimilarityAlgorithmFilter = .all,
         includeExact: Bool = true,
         scoreBucket: SimilarityScoreBucket = .all,
-        offset: Int = 0,
+        pagePosition: SimilarityPagePosition = .first,
         limit: Int = 24
     ) throws -> [SimilarityReviewItem] {
         try similarityCandidates(
@@ -978,7 +978,7 @@ actor CatalogStore {
             algorithmFilter: algorithmFilter,
             includeExact: includeExact,
             scoreBucket: scoreBucket,
-            offset: offset,
+            pagePosition: pagePosition,
             limit: limit
         )
     }
@@ -990,10 +990,24 @@ actor CatalogStore {
         algorithmFilter: SimilarityAlgorithmFilter = .all,
         includeExact: Bool = true,
         scoreBucket: SimilarityScoreBucket = .all,
-        offset: Int = 0,
+        pagePosition: SimilarityPagePosition = .first,
         limit: Int = 24
     ) throws -> [SimilarityReviewItem] {
         let rootFilter = makeRootFilter(rootIDs)
+        let queryParts = makeSimilarityQueryParts(
+            rootFilter: rootFilter,
+            includeReviewed: includeReviewed,
+            reviewedOnly: reviewedOnly,
+            algorithmFilter: algorithmFilter,
+            includeExact: includeExact,
+            scoreBucket: scoreBucket,
+            pagePosition: pagePosition
+        )
+        let orderClause = if case .last = pagePosition {
+            "ORDER BY c.score ASC, c.id DESC"
+        } else {
+            "ORDER BY c.score DESC, c.id ASC"
+        }
         let statement = try prepare(
             """
             SELECT
@@ -1014,49 +1028,16 @@ actor CatalogStore {
                AND fb.feature_kind = 'fast_features'
                AND fb.algorithm_version = 'fast-v1'
             LEFT JOIN review_decisions AS d ON d.candidate_id = c.id
-            WHERE a.state = 'active'
-              AND b.state = 'active'
-              AND \(rootFilter.clause)
-              AND (? = 1 OR (d.decision IS NULL AND c.score > ?))
-              AND (? = 0 OR d.decision IS NOT NULL)
-              AND (? IS NULL OR c.algorithm_version = ?)
-              AND (? = 1 OR c.algorithm_version != 'exact-v1')
-              AND (? IS NULL OR c.score >= ?)
-              AND (? IS NULL OR c.score < ?)
-            ORDER BY c.score DESC, c.id ASC
-            LIMIT ? OFFSET ?;
+            WHERE \(queryParts.predicates.joined(separator: "\n              AND "))
+            \(orderClause)
+            LIMIT ?;
             """
         )
         defer { sqlite3_finalize(statement) }
 
         var parameterIndex: Int32 = 1
-        for rootValue in rootFilter.values {
-            try bind(rootValue, at: parameterIndex, to: statement)
-            parameterIndex += 1
-        }
-        try bind(Int64(includeReviewed ? 1 : 0), at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(SimilarityReviewPolicy.MIN_SCORE, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(Int64(reviewedOnly ? 1 : 0), at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(Int64(includeExact ? 1 : 0), at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(scoreBucket.lowerBound, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(scoreBucket.lowerBound, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(scoreBucket.upperBound, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(scoreBucket.upperBound, at: parameterIndex, to: statement)
-        parameterIndex += 1
+        try bind(queryParts.bindings, startingAt: &parameterIndex, to: statement)
         try bind(Int64(max(limit, 0)), at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(Int64(max(offset, 0)), at: parameterIndex, to: statement)
 
         var candidates: [SimilarityReviewItem] = []
         while true {
@@ -1118,7 +1099,76 @@ actor CatalogStore {
                 )
             )
         }
+        if case .last = pagePosition {
+            candidates.reverse()
+        }
         return candidates
+    }
+
+    private func makeSimilarityQueryParts(
+        rootFilter: RootFilter,
+        includeReviewed: Bool,
+        reviewedOnly: Bool,
+        algorithmFilter: SimilarityAlgorithmFilter,
+        includeExact: Bool = true,
+        scoreBucket: SimilarityScoreBucket = .all,
+        pagePosition: SimilarityPagePosition = .first
+    ) -> SimilarityQueryParts {
+        var predicates = [
+            "a.state = 'active'",
+            "b.state = 'active'",
+            rootFilter.clause,
+        ]
+        var bindings = rootFilter.values.map(SimilarityQueryBinding.text)
+
+        if !includeReviewed {
+            predicates.append("d.decision IS NULL")
+            predicates.append("c.score > ?")
+            bindings.append(.double(SimilarityReviewPolicy.MIN_SCORE))
+        }
+
+        if reviewedOnly {
+            predicates.append("d.decision IS NOT NULL")
+        }
+
+        if let algorithmVersion = algorithmFilter.algorithmVersion {
+            predicates.append("c.algorithm_version = ?")
+            bindings.append(.text(algorithmVersion))
+        }
+
+        if !includeExact {
+            predicates.append("c.algorithm_version != 'exact-v1'")
+        }
+
+        if let lowerBound = scoreBucket.lowerBound {
+            predicates.append("c.score >= ?")
+            bindings.append(.double(lowerBound))
+        }
+
+        if let upperBound = scoreBucket.upperBound {
+            predicates.append("c.score < ?")
+            bindings.append(.double(upperBound))
+        }
+
+        switch pagePosition {
+        case .first, .last:
+            break
+        case let .after(score, id):
+            predicates.append("(c.score < ? OR (c.score = ? AND c.id > ?))")
+            bindings.append(.double(score))
+            bindings.append(.double(score))
+            bindings.append(.text(id))
+        case let .before(score, id):
+            predicates.append("(c.score > ? OR (c.score = ? AND c.id < ?))")
+            bindings.append(.double(score))
+            bindings.append(.double(score))
+            bindings.append(.text(id))
+        }
+
+        return SimilarityQueryParts(
+            predicates: predicates,
+            bindings: bindings
+        )
     }
 
     func similarityDeletionTargets(
@@ -1127,6 +1177,31 @@ actor CatalogStore {
         scoreBucket: SimilarityScoreBucket = .all
     ) throws -> [PhotoDeletionTarget] {
         let rootFilter = makeRootFilter(rootIDs)
+        var predicates = [
+            "a.state = 'active'",
+            "b.state = 'active'",
+            rootFilter.clause,
+            "d.decision IN ('delete_a', 'delete_b')",
+            "c.score > ?",
+        ]
+        var bindings = rootFilter.values.map(SimilarityQueryBinding.text)
+        bindings.append(.double(SimilarityReviewPolicy.MIN_SCORE))
+
+        if let algorithmVersion = algorithmFilter.algorithmVersion {
+            predicates.append("c.algorithm_version = ?")
+            bindings.append(.text(algorithmVersion))
+        }
+
+        if let lowerBound = scoreBucket.lowerBound {
+            predicates.append("c.score >= ?")
+            bindings.append(.double(lowerBound))
+        }
+
+        if let upperBound = scoreBucket.upperBound {
+            predicates.append("c.score < ?")
+            bindings.append(.double(upperBound))
+        }
+
         let statement = try prepare(
             """
             WITH deletion_targets AS (
@@ -1136,14 +1211,7 @@ actor CatalogStore {
                 JOIN assets AS a ON a.id = c.asset_a_id
                 JOIN assets AS b ON b.id = c.asset_b_id
                 JOIN review_decisions AS d ON d.candidate_id = c.id
-                WHERE a.state = 'active'
-                  AND b.state = 'active'
-                  AND \(rootFilter.clause)
-                  AND d.decision IN ('delete_a', 'delete_b')
-                  AND c.score > ?
-                  AND (? IS NULL OR c.algorithm_version = ?)
-                  AND (? IS NULL OR c.score >= ?)
-                  AND (? IS NULL OR c.score < ?)
+                WHERE \(predicates.joined(separator: "\n                  AND "))
             )
             SELECT a.id, a.path, a.source_fingerprint
             FROM assets AS a
@@ -1166,23 +1234,7 @@ actor CatalogStore {
         defer { sqlite3_finalize(statement) }
 
         var parameterIndex: Int32 = 1
-        for rootValue in rootFilter.values {
-            try bind(rootValue, at: parameterIndex, to: statement)
-            parameterIndex += 1
-        }
-        try bind(SimilarityReviewPolicy.MIN_SCORE, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(algorithmFilter.algorithmVersion, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(scoreBucket.lowerBound, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(scoreBucket.lowerBound, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(scoreBucket.upperBound, at: parameterIndex, to: statement)
-        parameterIndex += 1
-        try bind(scoreBucket.upperBound, at: parameterIndex, to: statement)
+        try bind(bindings, startingAt: &parameterIndex, to: statement)
 
         var targets: [PhotoDeletionTarget] = []
         while true {
@@ -2110,6 +2162,8 @@ actor CatalogStore {
                 ON assets(root_id, state);
             CREATE INDEX IF NOT EXISTS idx_similarity_candidates_score
                 ON similarity_candidates(score DESC, id ASC);
+            CREATE INDEX IF NOT EXISTS idx_similarity_candidates_algorithm_score_id
+                ON similarity_candidates(algorithm_version, score DESC, id ASC);
 
             CREATE TRIGGER IF NOT EXISTS fast_feature_progress_insert
             AFTER INSERT ON scan_items WHEN NEW.phase = 'fast_features'
@@ -2425,6 +2479,22 @@ actor CatalogStore {
 
         guard result == SQLITE_OK else {
             throw IndexPhotosError.database("绑定文本参数失败")
+        }
+    }
+
+    private func bind(
+        _ values: [SimilarityQueryBinding],
+        startingAt parameterIndex: inout Int32,
+        to statement: OpaquePointer
+    ) throws {
+        for value in values {
+            switch value {
+            case .text(let text):
+                try bind(text, at: parameterIndex, to: statement)
+            case .double(let number):
+                try bind(number, at: parameterIndex, to: statement)
+            }
+            parameterIndex += 1
         }
     }
 

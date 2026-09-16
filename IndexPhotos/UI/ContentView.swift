@@ -514,6 +514,10 @@ private struct SimilarityCandidatesPanel: View {
                     .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
                 }
 
+                if model.similarityCandidateTotalCount > 0 {
+                    SimilarityCandidatesPagination()
+                }
+
                 if model.similarityCandidates.isEmpty,
                    model.isLoadingSimilarityCandidates
                 {

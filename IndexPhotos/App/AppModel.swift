@@ -44,6 +44,7 @@ final class AppModel {
     private var cacheLock: CacheLock?
     @ObservationIgnored private var progressTasks: [UUID: Task<Void, Never>] = [:]
     private var isSimilarityScoreBucketCustomized = false
+    private var similarityPagePosition: SimilarityPagePosition = .first
 
     var isReady: Bool {
         catalog != nil && coordinator != nil && cacheRoot != nil
@@ -298,7 +299,7 @@ final class AppModel {
     }
 
     var similarityVisibleCount: Int {
-        guard let bucketIndex = similarityScoreBucket.index else {
+        guard let bucketIndex = similarityScoreBucket.countIndex else {
             return similarityCandidateTotalCount
         }
         return similarityBucketCounts[bucketIndex]
@@ -325,7 +326,7 @@ final class AppModel {
     }
 
     func similarityBucketCount(for bucket: SimilarityScoreBucket) -> Int {
-        guard let bucketIndex = bucket.index else {
+        guard let bucketIndex = bucket.countIndex else {
             return similarityCandidateTotalCount
         }
         return similarityBucketCounts[bucketIndex]
@@ -362,6 +363,20 @@ final class AppModel {
         guard nextPageIndex != similarityPageIndex else {
             return
         }
+
+        similarityPagePosition = if nextPageIndex == 0 {
+            .first
+        } else if nextPageIndex == maximumPageIndex {
+            .last
+        } else if nextPageIndex > similarityPageIndex,
+                  let lastCandidate = similarityCandidates.last
+        {
+            .after(score: lastCandidate.score, id: lastCandidate.id)
+        } else if let firstCandidate = similarityCandidates.first {
+            .before(score: firstCandidate.score, id: firstCandidate.id)
+        } else {
+            .first
+        }
         similarityPageIndex = nextPageIndex
         refreshSimilarityCandidates()
     }
@@ -388,11 +403,13 @@ final class AppModel {
         isLoadingSimilarityCandidates = true
         if resetPage {
             similarityPageIndex = 0
+            similarityPagePosition = .first
         }
         let rootIDs = similarityQueryRootIDs
         let includeReviewed = showReviewedSimilarityCandidates
         let algorithmFilter = similarityAlgorithmFilter
         let scoreBucket = similarityScoreBucket
+        let pagePosition = similarityPagePosition
         let isUsingDefaultScoreBucket = !isSimilarityScoreBucketCustomized
         let pageIndex = similarityPageIndex
         let requestID = UUID()
@@ -407,21 +424,21 @@ final class AppModel {
                 )
                 let resolvedBucket: SimilarityScoreBucket = if isUsingDefaultScoreBucket,
                                                                  let highestBucket = SimilarityScoreBucket.valuesDescending.first(where: {
-                                                                     guard let bucketIndex = $0.index else {
+                                                                     guard let bucketIndex = $0.countIndex else {
                                                                          return false
                                                                      }
                                                                      return bucketCounts[bucketIndex] > 0
                                                                  })
                 {
                     highestBucket
-                } else if let bucketIndex = scoreBucket.index,
+                } else if let bucketIndex = scoreBucket.countIndex,
                           bucketCounts[bucketIndex] == 0
                 {
                     .all
                 } else {
                     scoreBucket
                 }
-                let visibleCount = resolvedBucket.index.map {
+                let visibleCount = resolvedBucket.countIndex.map {
                     bucketCounts[$0]
                 } ?? bucketCounts.reduce(0, +)
                 let pageCount = visibleCount > 0
@@ -438,7 +455,7 @@ final class AppModel {
                     reviewedOnly: includeReviewed,
                     algorithmFilter: algorithmFilter,
                     scoreBucket: resolvedBucket,
-                    offset: resolvedPageIndex * Self.SIMILARITY_PAGE_SIZE,
+                    pagePosition: pagePosition,
                     limit: Self.SIMILARITY_PAGE_SIZE
                 )
                 let deletionTargets = includeReviewed

@@ -867,21 +867,43 @@ final class CatalogStoreTests: XCTestCase {
         XCTAssertEqual(initialCandidates.first?.assetBSizeBytes, 1024)
         let bucketCounts = try await catalog.similarityCandidateCounts(rootID: rootID)
         XCTAssertEqual(bucketCounts.reduce(0, +), 3)
-        XCTAssertEqual(bucketCounts[9], 3)
+        XCTAssertEqual(bucketCounts.last, 3)
         let firstPage = try await catalog.similarityCandidates(
             rootID: rootID,
-            scoreBucket: SimilarityScoreBucket.values[9],
+            scoreBucket: SimilarityScoreBucket.values.last ?? .all,
             limit: 1
         )
+        let firstCandidate = try XCTUnwrap(firstPage.first)
         let secondPage = try await catalog.similarityCandidates(
             rootID: rootID,
-            scoreBucket: SimilarityScoreBucket.values[9],
-            offset: 1,
+            scoreBucket: SimilarityScoreBucket.values.last ?? .all,
+            pagePosition: .after(
+                score: firstCandidate.score,
+                id: firstCandidate.id
+            ),
             limit: 1
         )
         XCTAssertEqual(firstPage.count, 1)
         XCTAssertEqual(secondPage.count, 1)
         XCTAssertNotEqual(firstPage.first?.id, secondPage.first?.id)
+        let previousPage = try await catalog.similarityCandidates(
+            rootID: rootID,
+            scoreBucket: SimilarityScoreBucket.values.last ?? .all,
+            pagePosition: .before(
+                score: try XCTUnwrap(secondPage.first).score,
+                id: try XCTUnwrap(secondPage.first).id
+            ),
+            limit: 1
+        )
+        XCTAssertEqual(previousPage.first?.id, firstCandidate.id)
+        let lastPage = try await catalog.similarityCandidates(
+            rootID: rootID,
+            scoreBucket: SimilarityScoreBucket.values.last ?? .all,
+            pagePosition: .last,
+            limit: 1
+        )
+        XCTAssertEqual(lastPage.count, 1)
+        XCTAssertNotEqual(lastPage.first?.id, firstCandidate.id)
         let geometryEvidence = #"{"geometry":{"algorithm":"test-geometry-v1","status":"completed"}}"#
         let geometryCandidate = try XCTUnwrap(initialCandidates.first)
         try await catalog.updateSimilarityEvidence(

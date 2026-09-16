@@ -219,9 +219,20 @@ enum ReviewDecision: String, Codable, Sendable {
     case ignore
 }
 
+enum SimilarityPagePosition: Sendable {
+    case first
+    case after(score: Double, id: String)
+    case before(score: Double, id: String)
+    case last
+}
+
 struct SimilarityScoreBucket: Hashable, Identifiable, Sendable {
     static let all = SimilarityScoreBucket(index: nil)
-    static let values = (0..<10).map { SimilarityScoreBucket(index: $0) }
+    static let firstIndex = min(
+        max(Int(ceil(SimilarityReviewPolicy.MIN_SCORE * 10)), 0),
+        9
+    )
+    static let values = (firstIndex..<10).map { SimilarityScoreBucket(index: $0) }
     static let valuesDescending = values.reversed()
 
     let index: Int?
@@ -234,8 +245,15 @@ struct SimilarityScoreBucket: Hashable, Identifiable, Sendable {
         index.map(String.init) ?? "all"
     }
 
+    var countIndex: Int? {
+        guard let index else {
+            return nil
+        }
+        return index - Self.firstIndex
+    }
+
     var lowerBound: Double? {
-        guard let index, index > 0 else {
+        guard let index else {
             return nil
         }
         return Double(index) / 10
